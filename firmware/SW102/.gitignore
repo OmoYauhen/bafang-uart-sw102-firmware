@@ -2,3 +2,6 @@
 _build
 _release
 /emu
+*.bin
+*.pgm
+/out/

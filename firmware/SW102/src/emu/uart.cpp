@@ -21,8 +21,21 @@ extern uint16_t emu_voltage;
 
 static QSerialPort port;
 
-void uart_init() 
+void uart_init()
 {
+	const char *override = getenv("SW102_UART_PORT");
+	if (override) {
+		port.setPortName(override);
+		port.setBaudRate(19200);
+		if(port.open(QIODevice::ReadWrite)) {
+			qDebug() << "Opened (override)" << override;
+			emu_voltage = 480;
+			return;
+		}
+		qDebug() << "Failed to open SW102_UART_PORT" << override;
+		return;
+	}
+
 	for(auto & pi: QSerialPortInfo::availablePorts()) {
 		if(pi.portName().startsWith("ttyUSB")) {
 			port.setPort(pi);

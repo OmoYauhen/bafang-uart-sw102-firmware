@@ -7,6 +7,7 @@
  */
 
 #include <math.h>
+#include <stdbool.h>
 #include "stdio.h"
 #include "main.h"
 #include "utils.h"
@@ -99,6 +100,83 @@ static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {
     uart_send_tx_buffer(tx, 2);
 }
 
+// Bafang PAS-level wire encoding is non-monotonic (per bbs-fw extcom.c):
+// level_number → wire_code
+static const uint8_t bafang_pas_encoding[10] = {
+    0x00, // 0
+    0x01, // 1
+    0x0B, // 2
+    0x0C, // 3
+    0x0D, // 4
+    0x02, // 5
+    0x15, // 6
+    0x16, // 7
+    0x17, // 8
+    0x03, // 9
+};
+#define BAFANG_ASSIST_PUSH  0x06   // ASSIST_PUSH (walk mode)
+#define BAFANG_LIGHTS_ON    0xF1
+#define BAFANG_LIGHTS_OFF   0xF0
+
+static void bafang_send_write_pas(uint8_t wire_code) {
+    // WRITE_PAS: [0x16, 0x0B, code, checksum = sum of first 3]
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_WRITE;
+    tx[1] = 0x0B;
+    tx[2] = wire_code;
+    tx[3] = (uint8_t)(tx[0] + tx[1] + tx[2]);
+    uart_send_tx_buffer(tx, 4);
+    // WRITE_PAS has no reply.
+}
+
+static void bafang_send_write_lights(bool on) {
+    // WRITE_LIGHTS: [0x16, 0x1A, 0xF1 | 0xF0]  (no checksum per bbs-fw docs)
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_WRITE;
+    tx[1] = 0x1A;
+    tx[2] = on ? BAFANG_LIGHTS_ON : BAFANG_LIGHTS_OFF;
+    uart_send_tx_buffer(tx, 3);
+    // No reply.
+}
+
+// Last-sent wire values, so we only transmit on user-initiated change.
+// 0xFF is a "never sent" sentinel that guarantees an initial sync.
+static uint8_t bafang_last_pas_code = 0xFF;
+static uint8_t bafang_last_lights   = 0xFF;
+
+// Compute the target Bafang PAS wire code for the current UI state.
+static uint8_t bafang_desired_pas_code(void) {
+    if (ui_vars.ui8_walk_assist)
+        return BAFANG_ASSIST_PUSH;
+    uint8_t level = ui_vars.ui8_assist_level;
+    if (level > 9) level = 9;
+    return bafang_pas_encoding[level];
+}
+
+// Try to send one pending WRITE. Returns true if a write was sent (in which
+// case the caller should skip its READ for this tick to avoid overlap).
+// Requires that we've received at least one reply — no point talking to a
+// motor that isn't there yet.
+static bool bafang_try_send_pending_write(void) {
+    if (g_bafang.rx_count == 0) return false;
+
+    uint8_t desired_pas = bafang_desired_pas_code();
+    if (desired_pas != bafang_last_pas_code) {
+        bafang_send_write_pas(desired_pas);
+        bafang_last_pas_code = desired_pas;
+        return true;
+    }
+
+    uint8_t desired_lights = ui_vars.ui8_lights ? BAFANG_LIGHTS_ON : BAFANG_LIGHTS_OFF;
+    if (desired_lights != bafang_last_lights) {
+        bafang_send_write_lights(ui_vars.ui8_lights);
+        bafang_last_lights = desired_lights;
+        return true;
+    }
+
+    return false;
+}
+
 // Convert wheel RPM to (kph × 10) using the configured wheel perimeter (mm):
 //   kph = rpm * perimeter_mm * 60 / 1e6
 //   kph_x10 = rpm * perimeter_mm * 6 / 10000
@@ -166,6 +244,14 @@ static void bafang_apply_directs(void) {
     if (g_bafang.rx_count > 0) {
         ui8_g_battery_soc = g_bafang.battery_pct;
     }
+    // BBSHD doesn't report pedal cadence over the display protocol (only
+    // internal PAS pulse count is available, not RPM). Stub it at a
+    // sentinel value so UI fields dependent on cadence render *something*
+    // recognisable — revisit once we decide whether to synthesise it from
+    // PAS state, expose it via bbs-fw's config-tool protocol, or hide the
+    // cadence widgets entirely for BBSHD builds.
+    rt_vars.ui8_pedal_cadence = 99;
+    rt_vars.ui8_pedal_cadence_filtered = 99;
 }
 
 static void motor_init(void);
@@ -996,6 +1082,13 @@ void communications(void) {
   }
 
   if (!bafang_awaiting_reply && g_motor_init_state == MOTOR_INIT_READY) {
+    // WRITEs take priority over the next READ. If a state change is pending
+    // (user just changed assist level, toggled lights, held walk assist),
+    // send that first and skip this tick's READ — we'll pick up where the
+    // round-robin left off on the next tick.
+    if (bafang_try_send_pending_write())
+      return;
+
     bafang_send_read(
         bafang_read_cycle[bafang_cycle_pos].op,
         bafang_read_cycle[bafang_cycle_pos].reply_len);

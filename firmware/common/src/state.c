@@ -47,6 +47,91 @@ volatile motor_init_status_t ui8_g_motor_init_status = MOTOR_INIT_STATUS_RESET;
 
 tsdz2_firmware_version_t g_tsdz2_firmware_version = { 0xff, 0, 0 };
 
+// ---- Bafang UART protocol (source: bbs-fw/src/firmware/extcom.c) -----------
+// The display is master. Every 100 ms tick we advance one step in a
+// round-robin of READ opcodes: send the 2-byte request, prime RX for the
+// opcode's fixed reply length, then next tick parse the reply and advance.
+
+#define BAFANG_CAT_READ   0x11
+#define BAFANG_CAT_WRITE  0x16
+
+static const struct {
+    uint8_t op;
+    uint8_t reply_len;
+} bafang_read_cycle[] = {
+    { 0x08, 1 },  // STATUS
+    { 0x0A, 2 },  // CURRENT      (amp_x2, chk = same byte)
+    { 0x11, 2 },  // BATTERY      (percent, chk = same byte)
+    { 0x20, 3 },  // SPEED        (rpm_hi, rpm_lo, chk = sum + 0x20)
+    { 0x22, 3 },  // RANGE        (bbs-fw stuffs motor temperature here)
+    { 0x24, 3 },  // CALORIES     (bbs-fw stuffs battery voltage x10 here)
+    { 0x31, 2 },  // MOVING       (0x30 still / 0x31 moving, chk = same byte)
+};
+#define BAFANG_CYCLE_LEN (sizeof(bafang_read_cycle) / sizeof(bafang_read_cycle[0]))
+
+static uint8_t bafang_cycle_pos = 0;
+static uint8_t bafang_awaiting_reply = 0;
+static uint16_t bafang_reply_timeout_ticks = 0;
+#define BAFANG_REPLY_TIMEOUT_TICKS 5   // 5 x 100ms = 500 ms
+
+// Parsed live state, populated from motor replies. UI mapping to
+// ui_vars/rt_vars is intentionally deferred to the next commit — for
+// now these globals are the smoke-test surface.
+struct bafang_state_t {
+    uint8_t  status;
+    uint8_t  battery_pct;
+    uint16_t wheel_rpm;
+    uint16_t battery_voltage_x10;
+    uint16_t range_field;         // motor temp or power (bbs-fw config-dependent)
+    uint8_t  current_amp_x2;
+    uint8_t  moving;
+    uint32_t rx_count;
+    uint32_t chk_fail_count;
+    uint32_t timeout_count;
+};
+volatile struct bafang_state_t g_bafang = { 0 };
+
+static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_READ;
+    tx[1] = opcode;
+    uart_prime_rx(reply_len);
+    uart_send_tx_buffer(tx, 2);
+}
+
+static void bafang_parse_reply(uint8_t opcode, const uint8_t *rx) {
+    switch (opcode) {
+    case 0x08:  // STATUS: 1 byte, no checksum
+        g_bafang.status = rx[0];
+        break;
+    case 0x0A:  // CURRENT: value + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.current_amp_x2 = rx[0];
+        break;
+    case 0x11:  // BATTERY: percent + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.battery_pct = rx[0];
+        break;
+    case 0x20:  // SPEED: rpm_hi, rpm_lo, chk = (sum + 0x20) & 0xFF
+        if ((uint8_t)(rx[0] + rx[1] + 0x20) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.wheel_rpm = ((uint16_t)rx[0] << 8) | rx[1];
+        break;
+    case 0x22:  // RANGE hijack: hi, lo, chk = (sum) & 0xFF
+        if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.range_field = ((uint16_t)rx[0] << 8) | rx[1];
+        break;
+    case 0x24:  // CALORIES hijack (battery voltage x10): same shape as RANGE
+        if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.battery_voltage_x10 = ((uint16_t)rx[0] << 8) | rx[1];
+        break;
+    case 0x31:  // MOVING: 0x30/0x31 + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.moving = (rx[0] == 0x31);
+        break;
+    }
+    g_bafang.rx_count++;
+}
+
 static void motor_init(void);
 
 void ui_motor_stabilized();
@@ -857,6 +942,32 @@ void automatic_power_off_management(void) {
 }
 
 void communications(void) {
+  // ---- Bafang round-robin: consume any pending reply, then send next request.
+  if (bafang_awaiting_reply) {
+    const uint8_t *rx = uart_get_rx_buffer_rdy();
+    if (rx) {
+      bafang_parse_reply(bafang_read_cycle[bafang_cycle_pos].op, rx);
+      bafang_cycle_pos = (bafang_cycle_pos + 1) % BAFANG_CYCLE_LEN;
+      bafang_awaiting_reply = 0;
+      bafang_reply_timeout_ticks = 0;
+    } else if (++bafang_reply_timeout_ticks >= BAFANG_REPLY_TIMEOUT_TICKS) {
+      // No reply within timeout — resync to next opcode.
+      g_bafang.timeout_count++;
+      bafang_cycle_pos = (bafang_cycle_pos + 1) % BAFANG_CYCLE_LEN;
+      bafang_awaiting_reply = 0;
+      bafang_reply_timeout_ticks = 0;
+    }
+  }
+
+  if (!bafang_awaiting_reply && g_motor_init_state == MOTOR_INIT_READY) {
+    bafang_send_read(
+        bafang_read_cycle[bafang_cycle_pos].op,
+        bafang_read_cycle[bafang_cycle_pos].reply_len);
+    bafang_awaiting_reply = 1;
+  }
+  return;
+
+  // ---- Old TSDZ2 code below is dead but kept for reference during the port.
   frame_type_t ui8_frame;
   uint8_t process_frame = 0;
   uint16_t ui16_temp;

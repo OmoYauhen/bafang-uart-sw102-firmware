@@ -35,12 +35,19 @@ static const app_uart_comm_params_t comm_params =
     //Below values are defined in ser_config.h common for application and connectivity
     .flow_control = APP_UART_FLOW_CONTROL_DISABLED,
     .use_parity   = false,
-    .baud_rate    = UART_BAUDRATE_BAUDRATE_Baud19200
+    // Bafang display UART: 1200 baud (TSDZ2 was 19200).
+    .baud_rate    = UART_BAUDRATE_BAUDRATE_Baud1200
 };
 
 uint8_t ui8_rx_buffer[UART_NUMBER_DATA_BYTES_TO_RECEIVE];
 uint8_t ui8_tx_buffer[UART_NUMBER_DATA_BYTES_TO_SEND];
 volatile uint8_t ui8_received_package_flag = 0;
+
+// Bafang replies have no start byte, no length byte, no CRC16 —
+// only the requester knows the reply length (per opcode). The caller
+// primes this via uart_prime_rx() before sending each request.
+static volatile uint8_t ui8_expected_rx_len = 0;
+static volatile uint8_t ui8_rx_cnt = 0;
 
 uint8_t* uart_get_tx_buffer(void)
 {
@@ -60,85 +67,45 @@ uint8_t usart1_received_package(void)
 void usart1_reset_received_package(void)
 {
   ui8_received_package_flag = 0;
+  ui8_expected_rx_len = 0;
+  ui8_rx_cnt = 0;
+}
+
+void uart_prime_rx(uint8_t expected_len)
+{
+  ui8_expected_rx_len = expected_len;
+  ui8_rx_cnt = 0;
+  ui8_received_package_flag = 0;
 }
 
 void uart_evt_callback(app_uart_evt_t * uart_evt)
 {
   uint8_t ui8_byte_received;
-  static uint8_t ui8_state_machine = 0;
-  static uint8_t ui8_rx[UART_NUMBER_DATA_BYTES_TO_RECEIVE];
-  static uint8_t ui8_rx_cnt = 0;
-  uint8_t ui8_i;
-  uint16_t ui16_crc_rx;
 
   switch (uart_evt->evt_type)
   {
     case APP_UART_DATA:
-      //Data is ready on the UART
       ui8_byte_received = app_uart_get();
-      switch (ui8_state_machine)
-      {
-        case 0:
-        if (ui8_byte_received == 0x43) { // see if we get start package byte
-          ui8_rx[0] = ui8_byte_received;
-          ui8_state_machine = 1;
-        }
-        else {
-          ui8_state_machine = 0;
-        }
 
-        ui8_rx_cnt = 0;
+      // If we have no active request or the buffer is already full,
+      // silently drop stray bytes. Bafang has no framing to resync on.
+      if (ui8_expected_rx_len == 0 || ui8_received_package_flag) {
         break;
-
-        case 1:
-          ui8_rx[1] = ui8_byte_received;
-          ui8_state_machine = 2;
-        break;
-
-        case 2:
-        ui8_rx[ui8_rx_cnt + 2] = ui8_byte_received;
-        ++ui8_rx_cnt;
-
-        // reset if it is the last byte of the package and index is out of bounds
-        if (ui8_rx_cnt >= ui8_rx[1])
-        {
-          ui8_state_machine = 0;
-
-          // just to make easy next calculations
-          ui16_crc_rx = 0xffff;
-          for (ui8_i = 0; ui8_i < ui8_rx[1]; ui8_i++)
-          {
-            crc16(ui8_rx[ui8_i], &ui16_crc_rx);
-          }
-
-          // if CRC is correct read the package
-          if (((((uint16_t) ui8_rx[ui8_rx[1] + 1]) << 8) +
-                ((uint16_t) ui8_rx[ui8_rx[1]])) == ui16_crc_rx)
-          {
-            // copy to the other buffer only if we processed already the last package
-            if(!ui8_received_package_flag)
-            {
-              ui8_received_package_flag = 1;
-
-              // store the received data to rx_buffer
-              memcpy(ui8_rx_buffer, ui8_rx, ui8_rx[1] + 2);
-            }
-          }
-        }
-        break;
-
-        default:
-          ui8_state_machine = 0;
-          break;
       }
-    break;
+
+      if (ui8_rx_cnt < ui8_expected_rx_len) {
+        ui8_rx_buffer[ui8_rx_cnt++] = ui8_byte_received;
+        if (ui8_rx_cnt == ui8_expected_rx_len) {
+          ui8_received_package_flag = 1;
+        }
+      }
+      break;
 
     case APP_UART_TX_EMPTY:
-      //Data has been successfully transmitted on the UART
       break;
 
     case APP_UART_COMMUNICATION_ERROR:
-        ui8_state_machine = 0;
+      ui8_rx_cnt = 0;
       break;
 
     default:

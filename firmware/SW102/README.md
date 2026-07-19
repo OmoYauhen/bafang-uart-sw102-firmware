@@ -1,7 +1,14 @@
 # SW102_Display
 
-This is an alternate version of the SW102 firmware. Most of the settings are compatible with casainho's version, so you may refer
-to the original wiki pages, but please keep in mind that they describe a different version of the firmware:
+This is a fork of [anszom/SW102_LCD](https://github.com/anszom/SW102_LCD)
+ported from the TSDZ2 wire protocol to the Bafang display UART protocol used
+by BBS02 / BBSHD mid-drive motors. See the top-level [README](../../README.md)
+for lineage, compatibility notes, and feature list.
+
+Most of the display-side settings are still compatible with upstream
+`anszom/SW102_LCD` (and by extension `casainho/Color_LCD`), so these wiki
+pages remain a useful reference for the UI / configuration menus, though
+they describe a different motor-side protocol:
 - https://github.com/OpenSource-EBike-firmware/Color_LCD/wiki/Bafang-LCD-SW102
 - https://github.com/OpenSource-EBike-firmware/SW102_LCD_Bluetooth/wiki
 
@@ -48,8 +55,8 @@ type automatically.
 
 ### Motor UART
 
-The emulator opens a serial port at 19200 baud (TSDZ2). Two ways to
-connect:
+The emulator opens a serial port at 1200 baud (Bafang display UART).
+Two ways to connect:
 
 1. **Real motor.** Plug a Bafang programming cable into your motor and
    your PC. The emu auto-scans `/dev/ttyUSB*` and grabs the first match.

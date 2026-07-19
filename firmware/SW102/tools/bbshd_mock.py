@@ -76,7 +76,12 @@ class MotorState:
         self.assist_level       = "ASSIST_1"
         self.lights_on          = False
         self.status_code        = 0x00                # 0 = normal
-        self.wheel_size_inch_x10 = 280                # 28.0"
+        # Wheel *perimeter* in mm, matching the firmware's
+        # DEFAULT_VALUE_WHEEL_PERIMETER exactly (Bafang's own unit — not derived
+        # from inches × π, which would produce a slightly different number
+        # because Bafang's nominal "27.5\" wheel = 2100 mm" is a convention
+        # that accounts for tire deflection, not a pure geometric circumference).
+        self.wheel_perimeter_mm = args.perimeter      # default 2100
         self.t0 = time.monotonic()
 
     # bbs-fw formula from extcom.c process_bafang_display_read_speed:
@@ -86,8 +91,10 @@ class MotorState:
     # For 28": one rev = pi * 28 * 25.4mm = 2234 mm ≈ 2.234 m
     #   at 20 kph = 5.556 m/s → 5.556/2.234 = 2.487 rev/s = 149 rpm
     def wheel_rpm(self):
-        circ_m = math.pi * (self.wheel_size_inch_x10 / 10.0) * 0.0254
-        return int((self.wheel_kph * 1000.0 / 3600.0) / circ_m * 60.0)
+        # kph -> rpm using perimeter (mm): rpm = kph * 1e6 / (perimeter * 60)
+        # Kept as an integer to match the on-wire uint16, which is how the real
+        # motor MCU sees this value (integer Hall counts per unit time).
+        return int(self.wheel_kph * 1_000_000.0 / (self.wheel_perimeter_mm * 60.0))
 
     def voltage_x10(self):
         return int(self.battery_voltage_v * 10)
@@ -265,6 +272,8 @@ def main():
     ap.add_argument("--speed", type=float, default=0.0, help="initial wheel kph")
     ap.add_argument("--batt", type=float, default=90.0, help="initial battery %%")
     ap.add_argument("--baud", type=int, default=1200, help="Bafang baud (default 1200)")
+    ap.add_argument("--perimeter", type=int, default=2100,
+                    help="wheel perimeter in mm (default 2100, matches firmware default)")
     ap.add_argument("--verbose", "-v", action="store_true")
     args = ap.parse_args()
 

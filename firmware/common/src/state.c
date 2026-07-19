@@ -99,37 +99,73 @@ static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {
     uart_send_tx_buffer(tx, 2);
 }
 
+// Convert wheel RPM to (kph × 10) using the configured wheel perimeter (mm):
+//   kph = rpm * perimeter_mm * 60 / 1e6
+//   kph_x10 = rpm * perimeter_mm * 6 / 10000
+// For a 28" wheel (perimeter ≈ 2234 mm) at 164 rpm this yields 219 (= 21.9 kph).
+static uint16_t rpm_to_kph_x10(uint16_t rpm, uint16_t perimeter_mm) {
+    return (uint16_t)(((uint32_t)rpm * perimeter_mm * 6u) / 10000u);
+}
+
 static void bafang_parse_reply(uint8_t opcode, const uint8_t *rx) {
     switch (opcode) {
     case 0x08:  // STATUS: 1 byte, no checksum
         g_bafang.status = rx[0];
+        rt_vars.ui8_error_states = rx[0];
         break;
-    case 0x0A:  // CURRENT: value + degenerate 1B checksum
+
+    case 0x0A:  // CURRENT: amp_x2 + degenerate 1B checksum
         if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
         g_bafang.current_amp_x2 = rx[0];
+        // amp_x2 → amp_x5 conversion for the existing UI pipeline
+        rt_vars.ui8_battery_current_x5 = (uint8_t)(((uint16_t)rx[0] * 5u) / 2u);
         break;
+
     case 0x11:  // BATTERY: percent + degenerate 1B checksum
         if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
         g_bafang.battery_pct = rx[0];
+        // Note: ui8_g_battery_soc override happens in bafang_apply_directs()
+        // AFTER rt_calc_battery_soc() runs; setting it here would be clobbered.
         break;
+
     case 0x20:  // SPEED: rpm_hi, rpm_lo, chk = (sum + 0x20) & 0xFF
         if ((uint8_t)(rx[0] + rx[1] + 0x20) != rx[2]) { g_bafang.chk_fail_count++; return; }
         g_bafang.wheel_rpm = ((uint16_t)rx[0] << 8) | rx[1];
+        rt_vars.ui16_wheel_speed_x10 =
+            rpm_to_kph_x10(g_bafang.wheel_rpm, rt_vars.ui16_wheel_perimeter);
         break;
-    case 0x22:  // RANGE hijack: hi, lo, chk = (sum) & 0xFF
+
+    case 0x22:  // RANGE hijack (motor temperature in °C by bbs-fw default)
         if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
         g_bafang.range_field = ((uint16_t)rx[0] << 8) | rx[1];
+        // Motor temp fits in one byte; ignore hi byte unless someone configures
+        // bbs-fw to report power in this slot instead.
+        rt_vars.ui8_motor_temperature = (uint8_t)rx[1];
         break;
-    case 0x24:  // CALORIES hijack (battery voltage x10): same shape as RANGE
+
+    case 0x24:  // CALORIES hijack: battery voltage × 10
         if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
         g_bafang.battery_voltage_x10 = ((uint16_t)rx[0] << 8) | rx[1];
+        rt_vars.ui16_battery_voltage_filtered_x10 = g_bafang.battery_voltage_x10;
         break;
+
     case 0x31:  // MOVING: 0x30/0x31 + degenerate 1B checksum
         if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
         g_bafang.moving = (rx[0] == 0x31);
         break;
     }
     g_bafang.rx_count++;
+}
+
+// Post-processing hook: called at the very end of rt_processing(), AFTER
+// all rt_calc_* functions have run. Reasserts direct-from-motor readings
+// that would otherwise be overwritten by voltage-based / Wh-based calcs.
+static void bafang_apply_directs(void) {
+    // The motor reports battery percent directly; that's more accurate
+    // than the display's Wh-integrator, so make it authoritative.
+    if (g_bafang.rx_count > 0) {
+        ui8_g_battery_soc = g_bafang.battery_pct;
+    }
 }
 
 static void motor_init(void);
@@ -1096,6 +1132,7 @@ void rt_processing(void)
   /************************************************************************************************/
   rt_first_time_management();
   rt_calc_battery_soc();
+  bafang_apply_directs();
 }
 
 void prepare_torque_sensor_calibration_table(void) {

@@ -133,7 +133,7 @@ void do_resize_assist_levels(const struct configtree_t *ign);
 void do_interpolate_assist_levels(const struct configtree_t *ign);
 
 const struct assist_scroller_config cfg_assist = { { 20, 26, 36, 0, 76, (const struct configtree_t[]) {
-	{ "Assist levels", F_NUMERIC | F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(ui_vars.ui8_number_of_assist_levels), 0, "", 1, 20 }, do_change_assist_levels }},
+	{ "Assist levels", F_NUMERIC | F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(ui_vars.ui8_number_of_assist_levels), 0, "", 1, 9 }, do_change_assist_levels }},
 	{ "Rescale all", F_NUMERIC | F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(tmp_rescale), 0, "%", 25, 400, 5 }, rescale_update, rescale_preview, rescale_revert }},
 	// this is a template
 	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "%", 1, 3200 /* we could go up to about 300x assist, but even 30x is absurd */ } }}

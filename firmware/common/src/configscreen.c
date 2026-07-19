@@ -96,7 +96,7 @@ static Field torqueSensorMenus[] =
 
 static Field assistMenus[] =
 		{
-						FIELD_EDITABLE_UINT(_S("Num assist levels", "Num Levels"), &ui_vars.ui8_number_of_assist_levels, "", 1, 20),
+						FIELD_EDITABLE_UINT(_S("Num assist levels", "Num Levels"), &ui_vars.ui8_number_of_assist_levels, "", 1, 9),
 						FIELD_EDITABLE_UINT("Level 1", &ui_vars.ui16_assist_level_factor[0], "", 1, 65535, .div_digits = 3),
 						FIELD_EDITABLE_UINT("Level 2", &ui_vars.ui16_assist_level_factor[1], "", 1, 65535, .div_digits = 3),
 						FIELD_EDITABLE_UINT("Level 3", &ui_vars.ui16_assist_level_factor[2], "", 1, 65535, .div_digits = 3),

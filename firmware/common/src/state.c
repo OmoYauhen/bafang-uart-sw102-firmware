@@ -7,6 +7,7 @@
  */
 
 #include <math.h>
+#include <stdbool.h>
 #include "stdio.h"
 #include "main.h"
 #include "utils.h"
@@ -21,28 +22,226 @@
 #include <stdlib.h>
 #include "screen.h"
 
-//#define DEBUG_TSDZ2_FIRMWARE
-
-typedef enum {
-  FRAME_TYPE_ALIVE = 0,
-  FRAME_TYPE_STATUS = 1,
-  FRAME_TYPE_PERIODIC = 2,
-  FRAME_TYPE_CONFIGURATIONS = 3,
-  FRAME_TYPE_FIRMWARE_VERSION = 4,
-} frame_type_t;
-
-static uint8_t ui8_m_usart1_received_first_package = 0;
 uint8_t ui8_g_battery_soc;
 volatile uint8_t ui8_g_motorVariablesStabilized = 0;
 
-volatile uint8_t m_get_tsdz2_firmware_version; // true if we are simulating a motor (and therefore not talking on serial at all)
-volatile motor_init_state_t g_motor_init_state = MOTOR_INIT_GET_MOTOR_ALIVE;
+// Skip the TSDZ2 boot handshake: no ALIVE query, no firmware-version query,
+// no CONFIGURATIONS exchange. The Bafang protocol has no such handshake
+// (display is master, motor never speaks first), so those TSDZ2-specific
+// states would otherwise deadlock the display at the boot animation forever.
+// The RX/TX code in the READY state runs the normal protocol loop.
+volatile motor_init_state_t g_motor_init_state = MOTOR_INIT_READY;
 volatile motor_init_state_config_t g_motor_init_state_conf = MOTOR_INIT_CONFIG_SEND_CONFIG;
 volatile motor_init_status_t ui8_g_motor_init_status = MOTOR_INIT_STATUS_RESET;
 
 tsdz2_firmware_version_t g_tsdz2_firmware_version = { 0xff, 0, 0 };
 
-static void motor_init(void);
+// ---- Bafang UART protocol (source: bbs-fw/src/firmware/extcom.c) -----------
+// The display is master. Every 100 ms tick we advance one step in a
+// round-robin of READ opcodes: send the 2-byte request, prime RX for the
+// opcode's fixed reply length, then next tick parse the reply and advance.
+
+#define BAFANG_CAT_READ   0x11
+#define BAFANG_CAT_WRITE  0x16
+
+static const struct {
+    uint8_t op;
+    uint8_t reply_len;
+} bafang_read_cycle[] = {
+    { 0x08, 1 },  // STATUS
+    { 0x0A, 2 },  // CURRENT      (amp_x2, chk = same byte)
+    { 0x11, 2 },  // BATTERY      (percent, chk = same byte)
+    { 0x20, 3 },  // SPEED        (rpm_hi, rpm_lo, chk = sum + 0x20)
+    { 0x22, 3 },  // RANGE        (bbs-fw stuffs motor temperature here)
+    { 0x24, 3 },  // CALORIES     (bbs-fw stuffs battery voltage x10 here)
+    { 0x31, 2 },  // MOVING       (0x30 still / 0x31 moving, chk = same byte)
+};
+#define BAFANG_CYCLE_LEN (sizeof(bafang_read_cycle) / sizeof(bafang_read_cycle[0]))
+
+static uint8_t bafang_cycle_pos = 0;
+static uint8_t bafang_awaiting_reply = 0;
+static uint16_t bafang_reply_timeout_ticks = 0;
+#define BAFANG_REPLY_TIMEOUT_TICKS 5   // 5 x 100ms = 500 ms
+
+// Parsed live state, populated from motor replies. UI mapping to
+// ui_vars/rt_vars is intentionally deferred to the next commit — for
+// now these globals are the smoke-test surface.
+struct bafang_state_t {
+    uint8_t  status;
+    uint8_t  battery_pct;
+    uint16_t wheel_rpm;
+    uint16_t battery_voltage_x10;
+    uint16_t range_field;         // motor temp or power (bbs-fw config-dependent)
+    uint8_t  current_amp_x2;
+    uint8_t  moving;
+    uint32_t rx_count;
+    uint32_t chk_fail_count;
+    uint32_t timeout_count;
+};
+volatile struct bafang_state_t g_bafang = { 0 };
+
+static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_READ;
+    tx[1] = opcode;
+    uart_prime_rx(reply_len);
+    uart_send_tx_buffer(tx, 2);
+}
+
+// Bafang PAS-level wire encoding is non-monotonic (per bbs-fw extcom.c):
+// level_number → wire_code
+static const uint8_t bafang_pas_encoding[10] = {
+    0x00, // 0
+    0x01, // 1
+    0x0B, // 2
+    0x0C, // 3
+    0x0D, // 4
+    0x02, // 5
+    0x15, // 6
+    0x16, // 7
+    0x17, // 8
+    0x03, // 9
+};
+#define BAFANG_ASSIST_PUSH  0x06   // ASSIST_PUSH (walk mode)
+#define BAFANG_LIGHTS_ON    0xF1
+#define BAFANG_LIGHTS_OFF   0xF0
+
+static void bafang_send_write_pas(uint8_t wire_code) {
+    // WRITE_PAS: [0x16, 0x0B, code, checksum = sum of first 3]
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_WRITE;
+    tx[1] = 0x0B;
+    tx[2] = wire_code;
+    tx[3] = (uint8_t)(tx[0] + tx[1] + tx[2]);
+    uart_send_tx_buffer(tx, 4);
+    // WRITE_PAS has no reply.
+}
+
+static void bafang_send_write_lights(bool on) {
+    // WRITE_LIGHTS: [0x16, 0x1A, 0xF1 | 0xF0]  (no checksum per bbs-fw docs)
+    uint8_t *tx = uart_get_tx_buffer();
+    tx[0] = BAFANG_CAT_WRITE;
+    tx[1] = 0x1A;
+    tx[2] = on ? BAFANG_LIGHTS_ON : BAFANG_LIGHTS_OFF;
+    uart_send_tx_buffer(tx, 3);
+    // No reply.
+}
+
+// Last-sent wire values, so we only transmit on user-initiated change.
+// 0xFF is a "never sent" sentinel that guarantees an initial sync.
+static uint8_t bafang_last_pas_code = 0xFF;
+static uint8_t bafang_last_lights   = 0xFF;
+
+// Compute the target Bafang PAS wire code for the current UI state.
+static uint8_t bafang_desired_pas_code(void) {
+    if (ui_vars.ui8_walk_assist)
+        return BAFANG_ASSIST_PUSH;
+    uint8_t level = ui_vars.ui8_assist_level;
+    if (level > 9) level = 9;
+    return bafang_pas_encoding[level];
+}
+
+// Try to send one pending WRITE. Returns true if a write was sent (in which
+// case the caller should skip its READ for this tick to avoid overlap).
+// Requires that we've received at least one reply — no point talking to a
+// motor that isn't there yet.
+static bool bafang_try_send_pending_write(void) {
+    if (g_bafang.rx_count == 0) return false;
+
+    uint8_t desired_pas = bafang_desired_pas_code();
+    if (desired_pas != bafang_last_pas_code) {
+        bafang_send_write_pas(desired_pas);
+        bafang_last_pas_code = desired_pas;
+        return true;
+    }
+
+    uint8_t desired_lights = ui_vars.ui8_lights ? BAFANG_LIGHTS_ON : BAFANG_LIGHTS_OFF;
+    if (desired_lights != bafang_last_lights) {
+        bafang_send_write_lights(ui_vars.ui8_lights);
+        bafang_last_lights = desired_lights;
+        return true;
+    }
+
+    return false;
+}
+
+// Convert wheel RPM to (kph × 10) using the configured wheel perimeter (mm):
+//   kph = rpm * perimeter_mm * 60 / 1e6
+//   kph_x10 = rpm * perimeter_mm * 6 / 10000
+// For a 28" wheel (perimeter ≈ 2234 mm) at 164 rpm this yields 219 (= 21.9 kph).
+static uint16_t rpm_to_kph_x10(uint16_t rpm, uint16_t perimeter_mm) {
+    return (uint16_t)(((uint32_t)rpm * perimeter_mm * 6u) / 10000u);
+}
+
+static void bafang_parse_reply(uint8_t opcode, const uint8_t *rx) {
+    switch (opcode) {
+    case 0x08:  // STATUS: 1 byte, no checksum
+        g_bafang.status = rx[0];
+        rt_vars.ui8_error_states = rx[0];
+        break;
+
+    case 0x0A:  // CURRENT: amp_x2 + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.current_amp_x2 = rx[0];
+        // amp_x2 → amp_x5 conversion for the existing UI pipeline
+        rt_vars.ui8_battery_current_x5 = (uint8_t)(((uint16_t)rx[0] * 5u) / 2u);
+        break;
+
+    case 0x11:  // BATTERY: percent + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.battery_pct = rx[0];
+        // Note: ui8_g_battery_soc override happens in bafang_apply_directs()
+        // AFTER rt_calc_battery_soc() runs; setting it here would be clobbered.
+        break;
+
+    case 0x20:  // SPEED: rpm_hi, rpm_lo, chk = (sum + 0x20) & 0xFF
+        if ((uint8_t)(rx[0] + rx[1] + 0x20) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.wheel_rpm = ((uint16_t)rx[0] << 8) | rx[1];
+        rt_vars.ui16_wheel_speed_x10 =
+            rpm_to_kph_x10(g_bafang.wheel_rpm, rt_vars.ui16_wheel_perimeter);
+        break;
+
+    case 0x22:  // RANGE hijack (motor temperature in °C by bbs-fw default)
+        if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.range_field = ((uint16_t)rx[0] << 8) | rx[1];
+        // Motor temp fits in one byte; ignore hi byte unless someone configures
+        // bbs-fw to report power in this slot instead.
+        rt_vars.ui8_motor_temperature = (uint8_t)rx[1];
+        break;
+
+    case 0x24:  // CALORIES hijack: battery voltage × 10
+        if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.battery_voltage_x10 = ((uint16_t)rx[0] << 8) | rx[1];
+        rt_vars.ui16_battery_voltage_filtered_x10 = g_bafang.battery_voltage_x10;
+        break;
+
+    case 0x31:  // MOVING: 0x30/0x31 + degenerate 1B checksum
+        if (rx[0] != rx[1]) { g_bafang.chk_fail_count++; return; }
+        g_bafang.moving = (rx[0] == 0x31);
+        break;
+    }
+    g_bafang.rx_count++;
+}
+
+// Post-processing hook: called at the very end of rt_processing(), AFTER
+// all rt_calc_* functions have run. Reasserts direct-from-motor readings
+// that would otherwise be overwritten by voltage-based / Wh-based calcs.
+static void bafang_apply_directs(void) {
+    // The motor reports battery percent directly; that's more accurate
+    // than the display's Wh-integrator, so make it authoritative.
+    if (g_bafang.rx_count > 0) {
+        ui8_g_battery_soc = g_bafang.battery_pct;
+    }
+    // BBSHD doesn't report pedal cadence over the display protocol (only
+    // internal PAS pulse count is available, not RPM). Stub it at a
+    // sentinel value so UI fields dependent on cadence render *something*
+    // recognisable — revisit once we decide whether to synthesise it from
+    // PAS state, expose it via bbs-fw's config-tool protocol, or hide the
+    // cadence widgets entirely for BBSHD builds.
+    rt_vars.ui8_pedal_cadence = 99;
+    rt_vars.ui8_pedal_cadence_filtered = 99;
+}
+
 
 void ui_motor_stabilized();
 void ui_show_motor_status(motor_init_state_t state);
@@ -104,245 +303,7 @@ static uint16_t fakeRandom(uint32_t *storage, uint16_t minv, uint16_t maxv) {
     return *storage;
 }
 
-/**
- * Pretend we just received a randomized motor packet
- */
-void parse_simmotor() {
-  static uint32_t counter;
 
-  // execute at a slow rate so values can be seen on the graph
-  counter++;
-  if (counter % (1 * 10)) // 1 seconds
-    return;
-
-	const uint32_t min_bat10x = 400;
-	const uint32_t max_bat10x = 546;
-	const uint32_t max_cur10x = 140;
-  static uint32_t voltstore, curstore, speedstore, cadencestore, tempstore, diststore, pedalstore;
-
-	// per step of ADC ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000
-	// l2_vars.ui16_adc_battery_voltage = battery_voltage_10x_get() * 1000L / ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000;
-	rt_vars.ui16_adc_battery_voltage = fakeWave(&voltstore, min_bat10x,
-			max_bat10x) * 1000L / ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000;
-	// l2_vars.ui16_adc_battery_voltage = max_bat10x * 1000L / ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000;
-
-	// battery current drain x5
-	rt_vars.ui8_battery_current_x5 = fakeRandom(&curstore, 0, max_cur10x) / 2;
-
-	// motor current drain x5
-  rt_vars.ui8_motor_current_x5 = fakeRandom(&curstore, 0, max_cur10x) / 2;
-
-	rt_vars.ui16_wheel_speed_x10 = fakeRandom(&speedstore, 80, 300);
-    diststore += rt_vars.ui16_wheel_speed_x10 * 2.6; // speed x 10 to millimeters per 100 ms
-
-	rt_vars.ui8_braking = 0; // fake(0, 1);
-
-	rt_vars.ui8_adc_throttle = fake(0, 100);
-
-	if (rt_vars.ui8_temperature_limit_feature_enabled) {
-		rt_vars.ui8_motor_temperature = fakeWave(&tempstore, 20, 120);
-	} else {
-		rt_vars.ui8_throttle = fake(0, 100);
-	}
-
-	rt_vars.ui16_pedal_power_x10 = fakeRandom(&pedalstore, 0, 1000);
-
-	rt_vars.ui16_adc_pedal_torque_sensor = fake(0, 1023);
-
-	rt_vars.ui8_pedal_weight = fake(0, 100);
-
-	rt_vars.ui8_pedal_cadence = fakeRandom(&cadencestore, 0, 93);
-
-	rt_vars.ui8_duty_cycle = fake(0, 100);
-
-	rt_vars.ui16_motor_speed_erps = fake(0, 600);
-
-	rt_vars.ui8_foc_angle = fake(0, 100);
-
-	// error states
-	rt_vars.ui8_error_states = 0; // fake(0, ERROR_MAX);
-
-	// wheel_speed_sensor_tick_counter
-
-    if (diststore > rt_vars.ui16_wheel_perimeter) {
-        rt_vars.ui32_wheel_speed_sensor_tick_counter += 1;
-        diststore -= rt_vars.ui16_wheel_perimeter;
-    }
-}
-
-void rt_send_tx_package(frame_type_t type) {
-  uint8_t crc_len = 3; // minimun is 3
-	uint8_t *ui8_usart1_tx_buffer = uart_get_tx_buffer();
-
-	/************************************************************************************************/
-	// send tx package
-	// start up byte
-	ui8_usart1_tx_buffer[0] = 0x59;
-  ui8_usart1_tx_buffer[1] = crc_len;
-  // type of the frame
-	ui8_usart1_tx_buffer[2] = (uint8_t) type;
-
-	switch (type) {
-	  case FRAME_TYPE_PERIODIC:
-      if (rt_vars.ui8_walk_assist) {
-        // walk assist level is specified in duty cycle units -> do not adjust
-        ui8_usart1_tx_buffer[3] = (uint8_t) rt_vars.ui8_walk_assist_level_factor[((rt_vars.ui8_assist_level) - 1)];
-        ui8_usart1_tx_buffer[4] = 0;
-      } else if (rt_vars.ui8_assist_level) {
-        uint16_t ui16_temp = rt_vars.ui16_assist_level_factor[((rt_vars.ui8_assist_level) - 1)];
-        // the assist level is specified for the reference motor voltage
-        // adjust by current battery voltage
-        // Ignore battery voltage cut-off voltage, this can normally happen during the first
-        // seconds after startup, when the 'filtered' battery voltage is still converging.
-        if(rt_vars.ui16_battery_voltage_filtered_x10 >= rt_vars.ui16_battery_low_voltage_cut_off_x10)
-          ui16_temp = (unsigned int)ui16_temp * (rt_vars.ui8_motor_type ? 360 : 480) / rt_vars.ui16_battery_voltage_filtered_x10;
-
-        ui8_usart1_tx_buffer[3] = (uint8_t) (ui16_temp & 0xff);
-        ui8_usart1_tx_buffer[4] = (uint8_t) (ui16_temp >> 8);
-      } else {
-        // if rt_vars.ui8_assist_level = 0, send 0!! always disable motor when assist level is 0
-        ui8_usart1_tx_buffer[3] = 0;
-        ui8_usart1_tx_buffer[4] = 0;
-      }
-
-      ui8_usart1_tx_buffer[5] = (rt_vars.ui8_lights & 1) | ((rt_vars.ui8_walk_assist & 1) << 1);
-
-      // battery power limit
-      if (rt_vars.ui8_street_mode_enabled)
-      {
-        ui8_usart1_tx_buffer[6] = rt_vars.ui8_street_mode_power_limit_div25;
-      }
-      else
-      {
-        ui8_usart1_tx_buffer[6] = rt_vars.ui8_target_max_battery_power_div25;
-      }
-
-      // startup motor power boost
-      uint16_t ui16_temp = (uint8_t) rt_vars.ui16_startup_motor_power_boost_factor[((rt_vars.ui8_assist_level) - 1)];
-      ui8_usart1_tx_buffer[7] = (uint8_t) (ui16_temp & 0xff);
-      ui8_usart1_tx_buffer[8] = (uint8_t) (ui16_temp >> 8);
-
-      // wheel max speed
-      if (rt_vars.ui8_street_mode_enabled)
-      {
-        ui8_usart1_tx_buffer[9] = rt_vars.ui8_street_mode_speed_limit;
-      }
-      else
-      {
-        ui8_usart1_tx_buffer[9] = rt_vars.ui8_wheel_max_speed;
-      }
-
-      // motor temperature limit function or throttle
-      if (rt_vars.ui8_street_mode_enabled &&
-          rt_vars.ui8_street_mode_throttle_enabled)
-      {
-        ui8_usart1_tx_buffer[10] = rt_vars.ui8_temperature_limit_feature_enabled & 1;
-      }
-      else
-      {
-        ui8_usart1_tx_buffer[10] = rt_vars.ui8_temperature_limit_feature_enabled & 3;
-      }
-
-      // virtual throttle
-      ui8_usart1_tx_buffer[11] = (uint8_t) ((((uint16_t) rt_vars.ui8_throttle_virtual) * 255) / 100);
-
-      crc_len = 13;
-      ui8_usart1_tx_buffer[1] = crc_len;
-	    break;
-
-    // set configurations
-	  case FRAME_TYPE_CONFIGURATIONS:
-      // battery low voltage cut-off
-      ui8_usart1_tx_buffer[3] = (uint8_t) (rt_vars.ui16_battery_low_voltage_cut_off_x10 & 0xff);
-      ui8_usart1_tx_buffer[4] = (uint8_t) (rt_vars.ui16_battery_low_voltage_cut_off_x10 >> 8);
-
-      // wheel perimeter
-      ui8_usart1_tx_buffer[5] = (uint8_t) (rt_vars.ui16_wheel_perimeter & 0xff);
-      ui8_usart1_tx_buffer[6] = (uint8_t) (rt_vars.ui16_wheel_perimeter >> 8);
-
-      // battery max current
-      ui8_usart1_tx_buffer[7] = rt_vars.ui8_battery_max_current;
-
-      ui8_usart1_tx_buffer[8] = rt_vars.ui8_startup_motor_power_boost_feature_enabled |
-          (rt_vars.ui8_startup_motor_power_boost_always << 1) |
-          (rt_vars.ui8_startup_motor_power_boost_limit_power << 2) |
-          (rt_vars.ui8_torque_sensor_calibration_feature_enabled << 3) |
-          (rt_vars.ui8_torque_sensor_calibration_pedal_ground << 4) |
-          (rt_vars.ui8_motor_assistance_startup_without_pedal_rotation << 5) |
-          ((rt_vars.ui8_motor_type & 1) << 6);
-
-      // motor max current
-      ui8_usart1_tx_buffer[9] = rt_vars.ui8_motor_max_current;
-      // startup motor power boost time
-      ui8_usart1_tx_buffer[10] = rt_vars.ui8_startup_motor_power_boost_time;
-      // startup motor power boost fade time
-      ui8_usart1_tx_buffer[11] = rt_vars.ui8_startup_motor_power_boost_fade_time;
-
-      // motor over temperature min and max values to limit
-      ui8_usart1_tx_buffer[12] = rt_vars.ui8_motor_temperature_min_value_to_limit;
-      ui8_usart1_tx_buffer[13] = rt_vars.ui8_motor_temperature_max_value_to_limit;
-
-      ui8_usart1_tx_buffer[14] = rt_vars.ui8_ramp_up_amps_per_second_x10;
-
-      // TODO
-      // target speed for cruise
-      ui8_usart1_tx_buffer[15] = 0;
-
-      // torque sensor calibration tables
-      uint8_t j = 16;
-      for (uint8_t i = 0; i < 8; i++) {
-        ui8_usart1_tx_buffer[j++] = (uint8_t) rt_vars.ui16_torque_sensor_calibration_table_left[i][0];
-        ui8_usart1_tx_buffer[j++] = (uint8_t) (rt_vars.ui16_torque_sensor_calibration_table_left[i][0] >> 8);
-        ui8_usart1_tx_buffer[j++] = (uint8_t) rt_vars.ui16_torque_sensor_calibration_table_left[i][1];
-        ui8_usart1_tx_buffer[j++] = (uint8_t) (rt_vars.ui16_torque_sensor_calibration_table_left[i][1] >> 8);
-      }
-
-      for (uint8_t i = 0; i < 8; i++) {
-        ui8_usart1_tx_buffer[j++] = (uint8_t) rt_vars.ui16_torque_sensor_calibration_table_right[i][0];
-        ui8_usart1_tx_buffer[j++] = (uint8_t) (rt_vars.ui16_torque_sensor_calibration_table_right[i][0] >> 8);
-        ui8_usart1_tx_buffer[j++] = (uint8_t) rt_vars.ui16_torque_sensor_calibration_table_right[i][1];
-        ui8_usart1_tx_buffer[j++] = (uint8_t) (rt_vars.ui16_torque_sensor_calibration_table_right[i][1] >> 8);
-      }
-
-      // battery current min ADC
-      ui8_usart1_tx_buffer[79] = rt_vars.ui8_motor_current_min_adc;
-      ui8_usart1_tx_buffer[80] = (rt_vars.ui8_pedal_cadence_fast_stop |
-          (rt_vars.ui8_field_weakening << 1) |
-          (rt_vars.ui8_coast_brake_enable << 2) |
-          (rt_vars.ui8_motor_current_control_mode << 3));
-      ui8_usart1_tx_buffer[81] = rt_vars.ui8_coast_brake_adc;
-      ui8_usart1_tx_buffer[82] = rt_vars.ui8_adc_lights_current_offset;
-      ui8_usart1_tx_buffer[83] = rt_vars.ui8_torque_sensor_filter;
-      ui8_usart1_tx_buffer[84] = rt_vars.ui8_torque_sensor_adc_threshold;
-
-      crc_len = 86;
-      ui8_usart1_tx_buffer[1] = crc_len;
-	    break;
-
-	    case FRAME_TYPE_STATUS:
-	    case FRAME_TYPE_FIRMWARE_VERSION:
-	      // nothing to add to the package
-	      break;
-
-	    default:
-	      break;
-	}
-
-	// prepare crc of the package
-	uint16_t ui16_crc_tx = 0xffff;
-	for (uint8_t ui8_i = 0; ui8_i < crc_len; ui8_i++) {
-		crc16(ui8_usart1_tx_buffer[ui8_i], &ui16_crc_tx);
-	}
-	ui8_usart1_tx_buffer[crc_len] =
-			(uint8_t) (ui16_crc_tx & 0xff);
-	ui8_usart1_tx_buffer[crc_len + 1] =
-			(uint8_t) (ui16_crc_tx >> 8) & 0xff;
-	ui8_usart1_tx_buffer[crc_len + 2] = 0; // workaround for UART parsing bug in motor firmware 1.1.1
-
-	// send the full package to UART
-	if (g_motor_init_state != MOTOR_INIT_SIMULATING) // If we are simulating received packets never send real packets
-		uart_send_tx_buffer(ui8_usart1_tx_buffer, ui8_usart1_tx_buffer[1] + 3);
-}
 
 void rt_low_pass_filter_battery_voltage_current_power(void) {
 	static uint32_t ui32_battery_voltage_accumulated_x10000 = 0;
@@ -627,9 +588,10 @@ uint8_t rt_first_time_management(void) {
       ui_motor_stabilized();
     }
 
-	// don't update LCD up to we get first communication package from the motor controller
+	// don't update LCD until we've received the first few replies from the motor
+	// (Bafang: g_bafang.rx_count reaches 10 in ~1 second of successful round-robin)
 	if (ui8_motor_controller_init
-			&& (ui8_m_usart1_received_first_package < 10)) {
+			&& (g_bafang.rx_count < 10)) {
 		ui8_status = 1;
 	}
 	// this will be executed only 1 time at startup
@@ -852,120 +814,42 @@ void automatic_power_off_management(void) {
 }
 
 void communications(void) {
-  frame_type_t ui8_frame;
-  uint8_t process_frame = 0;
-  uint16_t ui16_temp;
-
-  const uint8_t *p_rx_buffer = uart_get_rx_buffer_rdy();
-
-  // process rx package if we are simulating or the UART had a packet
-  if ((g_motor_init_state == MOTOR_INIT_SIMULATING) || p_rx_buffer) {
-    if (g_motor_init_state == MOTOR_INIT_SIMULATING)
-      parse_simmotor();
-    else if (p_rx_buffer) {
-      // now process rx data
-      ui8_frame = (frame_type_t) p_rx_buffer[2];
-
-      switch (g_motor_init_state) {
-        case MOTOR_INIT_WAIT_MOTOR_ALIVE:
-          if (ui8_frame == FRAME_TYPE_ALIVE)
-            g_motor_init_state = MOTOR_INIT_GET_MOTOR_FIRMWARE_VERSION;
-          break;
-
-        case MOTOR_INIT_WAIT_MOTOR_FIRMWARE_VERSION:
-          if (ui8_frame == FRAME_TYPE_FIRMWARE_VERSION)
-            process_frame = 1;
-          break;
-
-        case MOTOR_INIT_WAIT_CONFIGURATIONS_OK:
-        case MOTOR_INIT_WAIT_GOT_CONFIGURATIONS_OK:
-          if (ui8_frame == FRAME_TYPE_STATUS)
-            process_frame = 1;
-          break;
-
-        case MOTOR_INIT_READY:
-            process_frame = 1;
-          break;
-      }
-
-      if (process_frame) {
-        switch (ui8_frame) {
-          case FRAME_TYPE_STATUS:
-            ui8_g_motor_init_status = p_rx_buffer[3];
-            break;
-
-          case FRAME_TYPE_PERIODIC:
-            rt_vars.ui16_adc_battery_voltage = p_rx_buffer[3] | (((uint16_t) (p_rx_buffer[4] & 0x30)) << 4);
-            rt_vars.ui8_battery_current_x5 = p_rx_buffer[5];
-            ui16_temp = ((uint16_t) p_rx_buffer[6]) | (((uint16_t) p_rx_buffer[7] << 8));
-            rt_vars.ui16_wheel_speed_x10 = ui16_temp & 0x7ff; // 0x7ff = 204.7km/h as the other bits are used for other things
-
-            uint8_t ui8_temp = p_rx_buffer[8];
-            rt_vars.ui8_braking = ui8_temp & 1;
-            rt_vars.ui8_motor_hall_sensors = (ui8_temp >> 1) & 7;
-            rt_vars.ui8_pas_pedal_right = (ui8_temp >> 4) & 1;
-            rt_vars.ui8_adc_throttle = p_rx_buffer[9];
-
-            if (rt_vars.ui8_temperature_limit_feature_enabled) {
-              rt_vars.ui8_motor_temperature = p_rx_buffer[10];
-            } else {
-              rt_vars.ui8_throttle = p_rx_buffer[10];
-            }
-
-            rt_vars.ui16_adc_pedal_torque_sensor = ((uint16_t) p_rx_buffer[11]) | (((uint16_t) (p_rx_buffer[7] & 0xC0)) << 2);
-            rt_vars.ui8_pedal_weight_with_offset = p_rx_buffer[12];
-            rt_vars.ui8_pedal_weight = p_rx_buffer[13];
-
-            rt_vars.ui8_pedal_cadence = p_rx_buffer[14];
-
-            rt_vars.ui8_duty_cycle = p_rx_buffer[15];
-
-            rt_vars.ui16_motor_speed_erps = ((uint16_t) p_rx_buffer[16]) | ((uint16_t) p_rx_buffer[17] << 8);
-            rt_vars.ui8_foc_angle = p_rx_buffer[18];
-            rt_vars.ui8_error_states = p_rx_buffer[19];
-            rt_vars.ui8_motor_current_x5 = p_rx_buffer[20];
-
-            uint32_t ui32_wheel_speed_sensor_tick_temp;
-            ui32_wheel_speed_sensor_tick_temp = ((uint32_t) p_rx_buffer[21]) |
-                (((uint32_t) p_rx_buffer[22]) << 8) | (((uint32_t) p_rx_buffer[23]) << 16);
-            rt_vars.ui32_wheel_speed_sensor_tick_counter = ui32_wheel_speed_sensor_tick_temp;
-
-            rt_vars.ui16_pedal_power_x10 = ((uint16_t) p_rx_buffer[24]) | ((uint16_t) p_rx_buffer[25] << 8);
-
-            ui16_temp = (uint16_t) p_rx_buffer[26];
-            rt_vars.ui16_adc_battery_current = ui16_temp | ((uint16_t) ((p_rx_buffer[7] & 0x18) << 5));
-            break;
-
-          case FRAME_TYPE_FIRMWARE_VERSION:
-            rt_vars.ui8_error_states = p_rx_buffer[3];
-            g_tsdz2_firmware_version.major = p_rx_buffer[4];
-            g_tsdz2_firmware_version.minor = p_rx_buffer[5];
-            g_tsdz2_firmware_version.patch = p_rx_buffer[6];
-            g_motor_init_state = MOTOR_INIT_GOT_MOTOR_FIRMWARE_VERSION;
-            break;
-        }
-      }
+  // ---- Bafang round-robin: consume any pending reply, then send next request.
+  if (bafang_awaiting_reply) {
+    const uint8_t *rx = uart_get_rx_buffer_rdy();
+    if (rx) {
+      bafang_parse_reply(bafang_read_cycle[bafang_cycle_pos].op, rx);
+      bafang_cycle_pos = (bafang_cycle_pos + 1) % BAFANG_CYCLE_LEN;
+      bafang_awaiting_reply = 0;
+      bafang_reply_timeout_ticks = 0;
+    } else if (++bafang_reply_timeout_ticks >= BAFANG_REPLY_TIMEOUT_TICKS) {
+      // No reply within timeout — resync to next opcode.
+      g_bafang.timeout_count++;
+      bafang_cycle_pos = (bafang_cycle_pos + 1) % BAFANG_CYCLE_LEN;
+      bafang_awaiting_reply = 0;
+      bafang_reply_timeout_ticks = 0;
     }
-
-    // let's wait for 10 packages, seems that first ADC battery voltages have incorrect values
-    ui8_m_usart1_received_first_package++;
-    if (ui8_m_usart1_received_first_package > 10)
-      ui8_m_usart1_received_first_package = 10;
   }
 
-  if (g_motor_init_state == MOTOR_INIT_READY)
-    rt_send_tx_package(FRAME_TYPE_PERIODIC);
+  if (!bafang_awaiting_reply && g_motor_init_state == MOTOR_INIT_READY) {
+    // WRITEs take priority over the next READ. If a state change is pending
+    // (user just changed assist level, toggled lights, held walk assist),
+    // send that first and skip this tick's READ — we'll pick up where the
+    // round-robin left off on the next tick.
+    if (bafang_try_send_pending_write())
+      return;
+
+    bafang_send_read(
+        bafang_read_cycle[bafang_cycle_pos].op,
+        bafang_read_cycle[bafang_cycle_pos].reply_len);
+    bafang_awaiting_reply = 1;
+  }
 }
 
 // Note: this called from ISR context every 100ms
 void rt_processing(void)
 {
   communications();
-
-  // called here because this state machine for motor_init should run every 100ms
-  // montor init processing must be done when exiting the configurations menu
-  // once motor is initialized, this should take almost no processing time
-  motor_init();
 
   /************************************************************************************************/
   // now do all the calculations that must be done every 100ms
@@ -980,6 +864,7 @@ void rt_processing(void)
   /************************************************************************************************/
   rt_first_time_management();
   rt_calc_battery_soc();
+  bafang_apply_directs();
 }
 
 void prepare_torque_sensor_calibration_table(void) {
@@ -1015,138 +900,6 @@ void prepare_torque_sensor_calibration_table(void) {
 
 
   rt_processing_start();
-}
-
-#define MIN_VOLTAGE_10X 140 // If our measured bat voltage (using ADC in the display) is lower than this, we assume we are running on a developers desk
-
-static void motor_init(void) {
-  static uint8_t ui8_once = 1;
-  static uint16_t ui16_motor_init_command_error_cnt = 0;
-  static uint8_t ui8_motor_init_status_cnt = 0;
-
-  if ((g_motor_init_state != MOTOR_INIT_ERROR) &&
-      (g_motor_init_state != MOTOR_INIT_ERROR_GET_FIRMWARE_VERSION) &&
-      (g_motor_init_state != MOTOR_INIT_ERROR_FIRMWARE_VERSION) &&
-      (g_motor_init_state != MOTOR_INIT_READY) &&
-      (g_motor_init_state != MOTOR_INIT_SIMULATING)
-#ifdef DEBUG_TSDZ2_FIRMWARE
-      && (buttons_get_onoff_state() == 0))
-#else
-      )
-#endif
-  {
-    if (ui8_once) {
-      ui8_once = 0;
-
-      // are we simulating?
-      bool sim = (battery_voltage_10x_get() < MIN_VOLTAGE_10X);
-      if (sim) {	      
-        g_motor_init_state = MOTOR_INIT_SIMULATING;
-        ui_show_motor_status(g_motor_init_state);
-      } else {
-        ui_show_motor_status(MOTOR_INIT_WAIT_MOTOR_ALIVE);
-      }
-    }
-
-    switch (g_motor_init_state) {
-      case MOTOR_INIT_GET_MOTOR_ALIVE:
-        ui16_motor_init_command_error_cnt = 500;
-        g_motor_init_state = MOTOR_INIT_WAIT_MOTOR_ALIVE;
-        // not break here to follow for next case
-
-      case MOTOR_INIT_WAIT_MOTOR_ALIVE:
-        // check timeout
-        ui16_motor_init_command_error_cnt--;
-        if (ui16_motor_init_command_error_cnt == 0) {
-          g_motor_init_state = MOTOR_INIT_GET_MOTOR_ALIVE;
-          ui_show_motor_status(g_motor_init_state);
-        }
-        break;
-
-      case MOTOR_INIT_GET_MOTOR_FIRMWARE_VERSION:
-        ui16_motor_init_command_error_cnt = 500;
-        g_motor_init_state = MOTOR_INIT_WAIT_MOTOR_FIRMWARE_VERSION;
-        // not break here to follow for next case
-
-      case MOTOR_INIT_WAIT_MOTOR_FIRMWARE_VERSION:
-        rt_send_tx_package(FRAME_TYPE_FIRMWARE_VERSION);
-        // check timeout
-        ui16_motor_init_command_error_cnt--;
-        if (ui16_motor_init_command_error_cnt == 0) {
-          g_motor_init_state = MOTOR_INIT_ERROR_GET_FIRMWARE_VERSION;
-          ui_show_motor_status(g_motor_init_state);
-        }
-        break;
-
-      case MOTOR_INIT_GOT_MOTOR_FIRMWARE_VERSION:
-        if (g_tsdz2_firmware_version.major == atoi(TSDZ2_FIRMWARE_MAJOR) &&
-            g_tsdz2_firmware_version.minor == atoi(TSDZ2_FIRMWARE_MINOR)) {
-
-            g_motor_init_state = MOTOR_INIT_SET_CONFIGURATIONS;
-            // not break here to follow for next case
-        } else {
-          g_motor_init_state = MOTOR_INIT_ERROR_FIRMWARE_VERSION;
-          ui_show_motor_status(g_motor_init_state);
-          break;
-        }
-
-      case MOTOR_INIT_SET_CONFIGURATIONS:
-        ui16_motor_init_command_error_cnt = 500;
-        g_motor_init_state_conf = MOTOR_INIT_CONFIG_SEND_CONFIG;
-        g_motor_init_state = MOTOR_INIT_WAIT_CONFIGURATIONS_OK;
-        // not break here to follow for next case
-
-      case MOTOR_INIT_WAIT_CONFIGURATIONS_OK:
-      case MOTOR_INIT_WAIT_GOT_CONFIGURATIONS_OK:
-        // check timeout
-        ui16_motor_init_command_error_cnt--;
-        if (ui16_motor_init_command_error_cnt == 0) {
-          g_motor_init_state = MOTOR_INIT_ERROR_SET_CONFIGURATIONS;
-          ui_show_motor_status(g_motor_init_state);
-          break;
-        }
-
-        switch (g_motor_init_state_conf) {
-          case MOTOR_INIT_CONFIG_SEND_CONFIG:
-            rt_send_tx_package(FRAME_TYPE_CONFIGURATIONS);
-            ui8_motor_init_status_cnt = 5;
-            g_motor_init_state_conf = MOTOR_INIT_CONFIG_GET_STATUS;
-            break;
-
-          case MOTOR_INIT_CONFIG_GET_STATUS:
-            rt_send_tx_package(FRAME_TYPE_STATUS);
-            g_motor_init_state_conf = MOTOR_INIT_CONFIG_CHECK_STATUS;
-            break;
-
-          case MOTOR_INIT_CONFIG_CHECK_STATUS:
-            if (ui8_g_motor_init_status == MOTOR_INIT_STATUS_RESET) {
-              ui8_motor_init_status_cnt--;
-              if (ui8_motor_init_status_cnt == 0) {
-                g_motor_init_state_conf = MOTOR_INIT_CONFIG_SEND_CONFIG;
-                break;
-              }
-            }
-
-            if (ui8_g_motor_init_status == MOTOR_INIT_STATUS_RESET) {
-              g_motor_init_state_conf = MOTOR_INIT_CONFIG_GET_STATUS;
-
-            } else if (ui8_g_motor_init_status == MOTOR_INIT_STATUS_GOT_CONFIG) {
-
-              g_motor_init_state = MOTOR_INIT_WAIT_GOT_CONFIGURATIONS_OK;
-              g_motor_init_state_conf = MOTOR_INIT_CONFIG_GET_STATUS;
-
-            } else if (ui8_g_motor_init_status == MOTOR_INIT_STATUS_INIT_OK) {
-
-              g_motor_init_state = MOTOR_INIT_READY; // finally
-
-              // reset state vars
-              g_motor_init_state_conf = MOTOR_INIT_CONFIG_SEND_CONFIG;
-              ui8_g_motor_init_status = MOTOR_INIT_STATUS_RESET;
-            }
-            break;
-        }
-    }
-  }
 }
 
 void batteryResistance(void) {

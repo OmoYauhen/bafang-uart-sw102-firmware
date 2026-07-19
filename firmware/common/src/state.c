@@ -36,7 +36,12 @@ uint8_t ui8_g_battery_soc;
 volatile uint8_t ui8_g_motorVariablesStabilized = 0;
 
 volatile uint8_t m_get_tsdz2_firmware_version; // true if we are simulating a motor (and therefore not talking on serial at all)
-volatile motor_init_state_t g_motor_init_state = MOTOR_INIT_GET_MOTOR_ALIVE;
+// Skip the TSDZ2 boot handshake: no ALIVE query, no firmware-version query,
+// no CONFIGURATIONS exchange. The Bafang protocol has no such handshake
+// (display is master, motor never speaks first), so those TSDZ2-specific
+// states would otherwise deadlock the display at the boot animation forever.
+// The RX/TX code in the READY state runs the normal protocol loop.
+volatile motor_init_state_t g_motor_init_state = MOTOR_INIT_READY;
 volatile motor_init_state_config_t g_motor_init_state_conf = MOTOR_INIT_CONFIG_SEND_CONFIG;
 volatile motor_init_status_t ui8_g_motor_init_status = MOTOR_INIT_STATUS_RESET;
 

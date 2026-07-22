@@ -66,7 +66,7 @@ static uint16_t bafang_reply_timeout_ticks = 0;
 // Parsed live state, populated from motor replies. Struct definition
 // lives in common/include/state.h so the Technical config screen can
 // render these as read-only diagnostics.
-volatile struct bafang_state_t g_bafang = { 0 };
+struct bafang_state_t g_bafang = { 0 };
 
 static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {
     uint8_t *tx = uart_get_tx_buffer();

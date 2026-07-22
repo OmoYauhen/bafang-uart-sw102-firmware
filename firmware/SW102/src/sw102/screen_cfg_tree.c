@@ -83,10 +83,23 @@ static const struct configtree_t cfgroot[] = {
 		{}
 	}}},
 	{ "Technical", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
+		// ---- Bafang READ replies (live from communications() round-robin) ----
+		{ "Motor status",     F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.status), 0, "" }},
+		{ "Wheel RPM",        F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.wheel_rpm), 0, "rpm" }},
+		{ "Battery voltage",  F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.battery_voltage_x10), 1, "V" }},
+		{ "Motor current",    F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.current_amp_x2), 0, "*0.5A" }},
+		{ "Motor temp/pwr",   F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.range_field), 0, "" }},
+		{ "Battery %",        F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.battery_pct), 0, "%" }},
+		{ "Moving",           F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.moving), 0, "" }},
+		// ---- UART link diagnostics ----
+		{ "RX packets",       F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.rx_count), 0, "" }},
+		{ "Checksum fails",   F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.chk_fail_count), 0, "" }},
+		{ "Reply timeouts",   F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(g_bafang.timeout_count), 0, "" }},
+		// ---- Stubs, revisit later ----
 		// BBSHD reports no pedal cadence over the display protocol; this
-		// currently reads a hard-coded stub (99). Will be revisited when we
-		// decide whether to synthesise from PAS state or hide the field.
-		{ "Cadence (stub)", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_cadence), 0, "rpm" }},
+		// currently reads a hard-coded 99. Revisit when we decide whether
+		// to synthesise from PAS state or hide the field.
+		{ "Cadence (stub)",   F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_cadence), 0, "rpm" }},
 		{},
 	}}},
 	{}

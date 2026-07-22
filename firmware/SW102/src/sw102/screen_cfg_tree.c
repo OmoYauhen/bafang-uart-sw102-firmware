@@ -11,14 +11,12 @@ static void do_reset_ble(const struct configtree_t *ign);
 static void do_reset_all(const struct configtree_t *ign);
 void cfg_push_assist_screen(const struct configtree_t *ign);
 void cfg_push_walk_assist_screen(const struct configtree_t *ign);
-void cfg_push_calibration_screen(const struct configtree_t *ign);
 
 static bool do_set_wh(const struct configtree_t *ign, int wh);
 static bool do_set_odometer(const struct configtree_t *ign, int wh);
 
 static const char *disable_enable[] = { "disable", "enable", 0 };
 static const char *off_on[] = { "off", "on", 0 };
-static const char *left_right[] = { "left", "right", 0 };
 
 static const struct configtree_t cfgroot[] = {
 	{ "Trip memory", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 18, 0, 128, (const struct configtree_t[]) {
@@ -32,7 +30,7 @@ static const struct configtree_t cfgroot[] = {
 		{},
 	}}},
 	{ "Battery", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-		{ "Max current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_battery_max_current), 0, "A", 1, 20 }},
+		{ "Max current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_battery_max_current), 0, "A", 1, 30 }},
  		{ "Cut-off voltage", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_battery_low_voltage_cut_off_x10), 1, "V", 160, 630 }},
 		{ "Resistance", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_battery_pack_resistance_x1000), 0, "mohm", 0, 1000 }},
 		{ "Voltage", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_battery_voltage_soc_x10), 1, "V" }},
@@ -48,29 +46,14 @@ static const struct configtree_t cfgroot[] = {
 		{},
 	}}},
 	{ "Motor", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-		{ "Motor voltage", F_OPTIONS, .options = &(const struct cfgoptions_t){ PTRSIZE(ui_vars.ui8_motor_type), (const char*[]){ "48V", "36V", 0}}},
-		{ "Max current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_motor_max_current), 0, "A", 1, 20 }},
+		{ "Max current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_motor_max_current), 0, "A", 1, 30 }},
 		{ "Current ramp", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_ramp_up_amps_per_second_x10), 1, "A", 4, 100 }},
-		{ "Control mode", F_OPTIONS, .options = &(const struct cfgoptions_t){ PTRSIZE(ui_vars.ui8_motor_current_control_mode), (const char*[]){ "power", "torque", 0}}},
-		{ "Min current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_motor_current_min_adc), 0, "steps", 0, 13 }},
-		{ "Field weakening", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_field_weakening), disable_enable } },
 		{},
 	}}},
-	{ "Torque sensor", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-		{ "ADC Threshold", F_NUMERIC, .numeric = &(const struct cfgnumeric_t){ PTRSIZE(ui_vars.ui8_torque_sensor_adc_threshold), 0, "", 5, 100 }},
-		{ "Startup assist", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_motor_assistance_startup_without_pedal_rotation), disable_enable }},
-		{ "Coast brake", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_coast_brake_enable), disable_enable }},
-		{ "Coast brake ADC", F_NUMERIC, .numeric = &(const struct cfgnumeric_t){ PTRSIZE(ui_vars.ui8_coast_brake_adc), 0, "", 5, 255 }},
-		{ "Sensor filter", F_NUMERIC, .numeric = &(const struct cfgnumeric_t){ PTRSIZE(ui_vars.ui8_torque_sensor_filter), 0, "", 0, 100 }},
-		{ "Start pedal ground", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_torque_sensor_calibration_pedal_ground), left_right }},
-		{ "Calibration", F_SUBMENU, .submenu = &(const struct scroller_config) { 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-			{ "Use calibration", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_torque_sensor_calibration_feature_enabled), disable_enable }},
-			{ "Left side", F_BUTTON, .action = cfg_push_calibration_screen },
-			{ "Right side", F_BUTTON, .action = cfg_push_calibration_screen },
-			{},
-		}}},
-		{},
-	}}},
+	// (BBSHD has no torque sensor — the whole Torque submenu, its calibration
+	//  screen, and Motor's TSDZ2 tuning knobs — Motor voltage, Control mode,
+	//  Min current, Field weakening — were removed when this display was
+	//  ported to the Bafang protocol.)
 	{ "Assist", F_BUTTON, .action = cfg_push_assist_screen },
 	{ "Walk assist", F_BUTTON, .action = cfg_push_walk_assist_screen },
 	{ "Temperature", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
@@ -90,8 +73,6 @@ static const struct configtree_t cfgroot[] = {
 		{},
 	}}},
 	{ "Various", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-		{ "Fast stop", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_pedal_cadence_fast_stop), disable_enable } },
-		{ "Lights current", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_adc_lights_current_offset), 0, "steps", 1, 4 }},
 		{ "Odometer", F_NUMERIC|F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(ui_vars.ui32_odometer_x10), 1, "km", 0, INT32_MAX-100 }, do_set_odometer }},
 		{ "Auto power off", F_NUMERIC, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_lcd_power_off_time_minutes), 0, "min", 0, 255 }},
 		{ "Reset BLE peers", F_BUTTON, .action = do_reset_ble },
@@ -102,18 +83,10 @@ static const struct configtree_t cfgroot[] = {
 		{}
 	}}},
 	{ "Technical", F_SUBMENU, .submenu = &(const struct scroller_config){ 20, 58, 36, 0, 128, (const struct configtree_t[]) {
-		{ "ADC battery current", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_adc_battery_current), 0, "" }},
-		{ "ADC throttle sensor", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_adc_throttle), 0, ""}},
-		{ "Throttle sensor", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_throttle), 0, ""}},
-		{ "ADC torque sensor", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_adc_pedal_torque_sensor), 0, ""}},
-		{ "Pedal side", F_OPTIONS|F_RO, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_pas_pedal_right), left_right }},
-		{ "Weight with offset", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_weight_with_offset), 0, "kg" }},
-		{ "Weight", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_weight), 0, "kg" }},
-		{ "Cadence", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_cadence), 0, "rpm" }},
-		{ "PWM duty-cycle", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_duty_cycle), 0, "" }},
-		{ "Motor speed", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui16_motor_speed_erps), 0, "" }},
-		{ "Motor FOC", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_foc_angle), 0, "" }},
-		{ "Hall sensors", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_motor_hall_sensors), 0, "" }},
+		// BBSHD reports no pedal cadence over the display protocol; this
+		// currently reads a hard-coded stub (99). Will be revisited when we
+		// decide whether to synthesise from PAS state or hide the field.
+		{ "Cadence (stub)", F_NUMERIC|F_RO, .numeric = &(const struct cfgnumeric_t) { PTRSIZE(ui_vars.ui8_pedal_cadence), 0, "rpm" }},
 		{},
 	}}},
 	{}
@@ -156,13 +129,6 @@ const struct assist_scroller_config cfg_walk_assist = { { 20, 26, 36, 0, 76, (co
 	// this is a template
 	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "%", 1, 100 } }}
 }, enumerate_assist_levels }, 1};
-
-bool enumerate_calibration(const struct scroller_config *cfg, int index, const struct scroller_item_t **it);
-const struct scroller_config cfg_calibration = { 20, 26, 36, 0, 76, (const struct configtree_t[]) {
-	// these are templates
-	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "kg", 0, 200 }}},
-	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "", 0, 1023 }}},
-}, enumerate_calibration };
 
 static void do_reset_trip_a(const struct configtree_t *ign)
 {

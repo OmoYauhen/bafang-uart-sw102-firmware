@@ -454,7 +454,13 @@ struct bafang_state_t {
     uint32_t chk_fail_count;        // per-opcode checksum failures
     uint32_t timeout_count;         // request → reply timeouts
 };
-extern volatile struct bafang_state_t g_bafang;
+// Not marked volatile: g_bafang is only ever read and written from main
+// context (bafang_parse_reply() is called from communications() which runs
+// on the ui_update tick, not from the UART RX ISR — that ISR writes the
+// raw byte buffer, and only main context turns those bytes into fields).
+// Keeping it non-volatile lets the menu system take a plain void* pointer
+// to any field via the PTRSIZE macro.
+extern struct bafang_state_t g_bafang;
 
 // Battery voltage (readed on motor controller):
 #define ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000 866

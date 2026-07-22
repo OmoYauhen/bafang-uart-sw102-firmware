@@ -69,6 +69,12 @@ BAFANG_LEVEL_TO_NAME = {
 class MotorState:
     def __init__(self, args):
         self.wheel_kph          = args.speed          # user-supplied initial
+        # Optional time-varying speed, to exercise the display's speed UI
+        # (digits, needle/graph, "moving" indicator) without a real wheel.
+        self.speed_wave         = args.speed_wave     # None = fixed speed
+        self.speed_min          = args.speed_min
+        self.speed_max          = args.speed_max
+        self.speed_period       = max(0.1, args.speed_period)
         self.battery_percent    = args.batt
         self.battery_voltage_v  = 52.0                # nominal for 14S
         self.motor_current_a    = 0.0
@@ -110,9 +116,22 @@ class MotorState:
         # Slowly drop battery percent + voltage over time to prove reactivity
         self.battery_percent   = max(0, self.battery_percent - dt * 0.01)
         self.battery_voltage_v = 42.0 + (self.battery_percent / 100.0) * 16.4
-        # Fake a gentle sinusoidal current draw for the "range" field
         t = time.monotonic() - self.t0
+        # Fake a gentle sinusoidal current draw for the "range" field
         self.motor_current_a = 5.0 + 3.0 * math.sin(t * 0.5)
+        # Optionally sweep the wheel speed across [min, max] to test the UI.
+        if self.speed_wave is not None:
+            lo, hi = self.speed_min, self.speed_max
+            phase = (t % self.speed_period) / self.speed_period   # 0..1
+            if self.speed_wave == "sine":
+                # smooth up-and-down: cos maps 0..1 -> lo..hi..lo
+                frac = (1.0 - math.cos(phase * 2.0 * math.pi)) / 2.0
+            elif self.speed_wave == "triangle":
+                # linear up then down
+                frac = 1.0 - abs(2.0 * phase - 1.0)
+            else:  # "sawtooth": ramp up then snap back to lo
+                frac = phase
+            self.wheel_kph = lo + (hi - lo) * frac
 
 
 # ---- Wire protocol helpers ---------------------------------------------------
@@ -269,7 +288,13 @@ def configure_baud(fd, baud):
 
 def main():
     ap = argparse.ArgumentParser(description="BBSHD motor emulator (Bafang UART).")
-    ap.add_argument("--speed", type=float, default=0.0, help="initial wheel kph")
+    ap.add_argument("--speed", type=float, default=0.0, help="fixed wheel kph (ignored if --speed-wave is set)")
+    ap.add_argument("--speed-wave", choices=["sine", "triangle", "sawtooth"], default=None,
+                    help="sweep speed over time instead of a fixed value, to test the speed UI")
+    ap.add_argument("--speed-min", type=float, default=0.0, help="min kph for --speed-wave (default 0)")
+    ap.add_argument("--speed-max", type=float, default=45.0, help="max kph for --speed-wave (default 45)")
+    ap.add_argument("--speed-period", type=float, default=20.0,
+                    help="seconds for one full --speed-wave cycle (default 20)")
     ap.add_argument("--batt", type=float, default=90.0, help="initial battery %%")
     ap.add_argument("--baud", type=int, default=1200, help="Bafang baud (default 1200)")
     ap.add_argument("--perimeter", type=int, default=2100,

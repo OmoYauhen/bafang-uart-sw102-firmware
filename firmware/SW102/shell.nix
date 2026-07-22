@@ -38,6 +38,8 @@ pkgs.mkShell {
     echo "  build:  make -f Makefile.emu"
     echo "  run:    ./emu"
     echo "  mock:   python3 -u tools/bbshd_mock.py --verbose --speed 18"
+    echo "  mock (sweep speed to test the UI):"
+    echo "          python3 -u tools/bbshd_mock.py --speed-wave sine --speed-min 0 --speed-max 45"
     echo "          then in another shell: SW102_UART_PORT=/dev/pts/N ./emu"
   '';
 }

@@ -120,13 +120,31 @@ static void bafang_send_write_lights(bool on) {
 static uint8_t bafang_last_pas_code = 0xFF;
 static uint8_t bafang_last_lights   = 0xFF;
 
+// Map the display's selectable assist level onto one of Bafang's 9 real PAS
+// levels. The rider picks how many levels to cycle through (3/5/9); those get
+// spread evenly across the motor's 1..9 range so the top selection always
+// reaches full assist:
+//   3 levels  -> real 1, 5, 9
+//   5 levels  -> real 1, 3, 5, 7, 9
+//   9 levels  -> real 1..9 (identity)
+// Display level 0 always means off (real 0). Formula for level L in 1..N:
+//   real = 1 + (L-1) * 8 / (N-1)
+static uint8_t bafang_real_level(uint8_t level, uint8_t n) {
+    if (level == 0)
+        return 0;               // off
+    if (level > n) level = n;
+    if (n <= 1)
+        return 9;               // degenerate config: single level -> full assist
+    return (uint8_t)(1u + ((uint16_t)(level - 1u) * 8u) / (n - 1u));
+}
+
 // Compute the target Bafang PAS wire code for the current UI state.
 static uint8_t bafang_desired_pas_code(void) {
     if (ui_vars.ui8_walk_assist)
         return BAFANG_ASSIST_PUSH;
-    uint8_t level = ui_vars.ui8_assist_level;
-    if (level > 9) level = 9;
-    return bafang_pas_encoding[level];
+    uint8_t real = bafang_real_level(ui_vars.ui8_assist_level,
+                                     ui_vars.ui8_number_of_assist_levels);
+    return bafang_pas_encoding[real];
 }
 
 // Try to send one pending WRITE. Returns true if a write was sent (in which
@@ -200,6 +218,16 @@ static void bafang_parse_reply(uint8_t opcode, const uint8_t *rx) {
     case 0x24:  // CALORIES hijack: battery voltage × 10
         if ((uint8_t)(rx[0] + rx[1]) != rx[2]) { g_bafang.chk_fail_count++; return; }
         g_bafang.battery_voltage_x10 = ((uint16_t)rx[0] << 8) | rx[1];
+        // The SW102 has no battery-voltage ADC on this port (it's bus-powered by
+        // the motor), so ui16_adc_battery_voltage is never sampled. Back-convert
+        // the motor-reported voltage into ADC units and feed it to the pipeline;
+        // rt_low_pass_filter_battery_voltage_current_power() otherwise recomputes
+        // ui16_battery_voltage_filtered_x10 from a zero ADC every cycle, clobbering
+        // this reading and forcing battery power (the right-hand bar) to zero.
+        //   adc = voltage_x10 * 1000 / ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000
+        rt_vars.ui16_adc_battery_voltage = (uint16_t)
+            (((uint32_t)g_bafang.battery_voltage_x10 * 1000u)
+                 / ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000);
         rt_vars.ui16_battery_voltage_filtered_x10 = g_bafang.battery_voltage_x10;
         break;
 

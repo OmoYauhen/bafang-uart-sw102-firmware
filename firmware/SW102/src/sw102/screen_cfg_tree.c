@@ -107,41 +107,50 @@ static const struct configtree_t cfgroot[] = {
 
 const struct scroller_config cfg_root = { 20, 58, 18, 0, 128,  cfgroot };
 
-static int tmp_rescale = 100;
-bool enumerate_assist_levels(const struct scroller_config *cfg, int index, const struct scroller_item_t **it);
-bool enumerate_walk_assist_levels(const struct scroller_config *cfg, int index, const struct scroller_item_t **it);
+// Bafang PAS: the rider only chooses how many discrete assist levels to cycle
+// through (3/5/9). The motor firmware owns the power delivered at each level, so
+// there is no per-level percentage tuning and no level-count interpolation to
+// recompute (Bafang doesn't support either).
+static void do_set_assist_levels_3(const struct configtree_t *ign);
+static void do_set_assist_levels_5(const struct configtree_t *ign);
+static void do_set_assist_levels_9(const struct configtree_t *ign);
 
-bool do_change_assist_levels(const struct configtree_t *ign, int newv);
-bool rescale_update(const struct configtree_t *it, int value);
-void rescale_preview(const struct configtree_t *it, int value);
-void rescale_revert(const struct configtree_t *it);
-void do_resize_assist_levels(const struct configtree_t *ign);
-void do_interpolate_assist_levels(const struct configtree_t *ign);
-
-const struct assist_scroller_config cfg_assist = { { 20, 26, 36, 0, 76, (const struct configtree_t[]) {
-	{ "Assist levels", F_NUMERIC | F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(ui_vars.ui8_number_of_assist_levels), 0, "", 1, 9 }, do_change_assist_levels }},
-	{ "Rescale all", F_NUMERIC | F_CALLBACK, .numeric_cb = &(const struct cfgnumeric_cb_t) { { PTRSIZE(tmp_rescale), 0, "%", 25, 400, 5 }, rescale_update, rescale_preview, rescale_revert }},
-	// this is a template
-	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "%", 1, 3200 /* we could go up to about 300x assist, but even 30x is absurd */ } }}
-}, enumerate_assist_levels }, 2 };
-
-const struct scroller_config cfg_levels_extend = { 20, 26, 18, 0, 76, (const struct configtree_t[]) {
-	{ "Interpolate", F_BUTTON, .action = do_interpolate_assist_levels },
-	{ "Add higher", F_BUTTON, .action = do_resize_assist_levels },
+const struct scroller_config cfg_assist = { 20, 58, 18, 0, 128, (const struct configtree_t[]) {
+	{ "3 levels", F_BUTTON, .action = do_set_assist_levels_3 },
+	{ "5 levels", F_BUTTON, .action = do_set_assist_levels_5 },
+	{ "9 levels", F_BUTTON, .action = do_set_assist_levels_9 },
 	{}
 }};
 
-const struct scroller_config cfg_levels_truncate = { 20, 26, 18, 0, 76, (const struct configtree_t[]) {
-	{ "Interpolate", F_BUTTON, .action = do_interpolate_assist_levels },
-	{ "Keep lowest", F_BUTTON, .action = do_resize_assist_levels },
+static void set_assist_levels(int n)
+{
+	ui_vars.ui8_number_of_assist_levels = n;
+	if(ui_vars.ui8_assist_level > n)
+		ui_vars.ui8_assist_level = n;
+	sstack_pop();
+}
+static void do_set_assist_levels_3(const struct configtree_t *ign) { set_assist_levels(3); }
+static void do_set_assist_levels_5(const struct configtree_t *ign) { set_assist_levels(5); }
+static void do_set_assist_levels_9(const struct configtree_t *ign) { set_assist_levels(9); }
+
+// Walk assist is a plain on/off feature; present it the same way as the assist
+// menu — a submenu listing the two choices as selectable rows.
+static void do_set_walk_assist_off(const struct configtree_t *ign);
+static void do_set_walk_assist_on(const struct configtree_t *ign);
+
+const struct scroller_config cfg_walk_assist = { 20, 58, 18, 0, 128, (const struct configtree_t[]) {
+	{ "Disabled", F_BUTTON, .action = do_set_walk_assist_off },
+	{ "Enabled", F_BUTTON, .action = do_set_walk_assist_on },
 	{}
 }};
 
-const struct assist_scroller_config cfg_walk_assist = { { 20, 26, 36, 0, 76, (const struct configtree_t[]) {
-	{ "Feature", F_OPTIONS, .options = &(const struct cfgoptions_t) { PTRSIZE(ui_vars.ui8_walk_assist_feature_enabled), disable_enable } },
-	// this is a template
-	{ (char[10]){}, F_NUMERIC | F_CALLBACK, .numeric_cb = &(struct cfgnumeric_cb_t) { { { 0, 0 }, 0, "%", 1, 100 } }}
-}, enumerate_assist_levels }, 1};
+static void set_walk_assist(int enabled)
+{
+	ui_vars.ui8_walk_assist_feature_enabled = enabled;
+	sstack_pop();
+}
+static void do_set_walk_assist_off(const struct configtree_t *ign) { set_walk_assist(0); }
+static void do_set_walk_assist_on(const struct configtree_t *ign) { set_walk_assist(1); }
 
 static void do_reset_trip_a(const struct configtree_t *ign)
 {

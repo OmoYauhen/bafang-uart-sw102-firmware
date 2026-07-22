@@ -178,8 +178,8 @@ typedef struct eeprom_data {
 
 // *************************************************************************** //
 // EEPROM memory variables default values
-#define DEFAULT_VALUE_ASSIST_LEVEL                                  0
-// Bafang BBSHD supports 9 discrete PAS levels (plus level 0 = off).
+#define DEFAULT_VALUE_ASSIST_LEVEL                                  1
+// Bafang PAS exposes a fixed choice of level counts: 3, 5 or 9.
 #define DEFAULT_VALUE_NUMBER_OF_ASSIST_LEVELS                       9
 #define DEFAULT_VALUE_WHEEL_PERIMETER                               2100 // 27.5'' wheel: 2100mm perimeter
 #define DEFAULT_VALUE_WHEEL_MAX_SPEED                               50

@@ -48,9 +48,9 @@ protected:
 			return &buttonUP;
 		if(evt->key() == Qt::Key_Down)
 			return &buttonDWN;
-		if(evt->key() == Qt::Key_M)
+		if(evt->key() == Qt::Key_M || evt->key() == Qt::Key_Return || evt->key() == Qt::Key_Enter)
 			return &buttonM;
-		if(evt->key() == Qt::Key_P)
+		if(evt->key() == Qt::Key_P || evt->key() == Qt::Key_Escape)
 			return &buttonPWR;
 
 		return NULL;

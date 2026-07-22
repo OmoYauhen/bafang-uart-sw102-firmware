@@ -29,10 +29,20 @@ Options:
 
 | Flag | Default | Purpose |
 |------|--------:|---------|
-| `--speed KPH`  | `0`  | Initial fake wheel speed |
+| `--speed KPH`  | `0`  | Fixed fake wheel speed (ignored if `--speed-wave` is set) |
+| `--speed-wave MODE` | off | Sweep speed over time to test the speed UI: `sine`, `triangle`, or `sawtooth` |
+| `--speed-min KPH` | `0`  | Low end of the `--speed-wave` sweep |
+| `--speed-max KPH` | `45` | High end of the `--speed-wave` sweep |
+| `--speed-period S` | `20` | Seconds for one full `--speed-wave` cycle |
 | `--batt PCT`   | `90` | Initial fake battery percent |
 | `--baud N`     | `1200` | UART baud (Bafang is 1200) |
 | `--verbose`    | off  | Log every packet, both directions |
+
+To exercise the speed display, sweep it instead of pinning it:
+
+```
+python3 -u tools/bbshd_mock.py --speed-wave sine --speed-min 0 --speed-max 45 --speed-period 20
+```
 
 ## Protocol coverage
 
@@ -56,6 +66,8 @@ The mock isn't fully static — every tick it:
 - Slowly drops the battery percent and voltage.
 - Oscillates the motor current so the RANGE field changes on each read.
 - Reports "moving" when speed > 0.
+- Optionally sweeps the wheel speed across `[--speed-min, --speed-max]`
+  when `--speed-wave` is given, so the SPEED field changes every read.
 
 Enough motion to prove the display's UI is actually reacting to bytes on
 the wire, without needing to model actual physics.

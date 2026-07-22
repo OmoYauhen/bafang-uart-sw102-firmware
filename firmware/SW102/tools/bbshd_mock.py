@@ -69,12 +69,20 @@ BAFANG_LEVEL_TO_NAME = {
 class MotorState:
     def __init__(self, args):
         self.wheel_kph          = args.speed          # user-supplied initial
+        # Optional time-varying speed, to exercise the display's speed UI
+        # (digits, needle/graph, "moving" indicator) without a real wheel.
+        self.speed_wave         = args.speed_wave     # None = fixed speed
+        self.speed_min          = args.speed_min
+        self.speed_max          = args.speed_max
+        self.speed_period       = max(0.1, args.speed_period)
         self.battery_percent    = args.batt
         self.battery_voltage_v  = 52.0                # nominal for 14S
         self.motor_current_a    = 0.0
         self.motor_temp_c       = 24
         self.assist_level       = "ASSIST_1"
         self.lights_on          = False
+        self.mode               = None                # last WRITE_MODE value
+        self.speed_limit        = None                # last WRITE_SPEED_LIM value
         self.status_code        = 0x00                # 0 = normal
         # Wheel *perimeter* in mm, matching the firmware's
         # DEFAULT_VALUE_WHEEL_PERIMETER exactly (Bafang's own unit — not derived
@@ -110,9 +118,22 @@ class MotorState:
         # Slowly drop battery percent + voltage over time to prove reactivity
         self.battery_percent   = max(0, self.battery_percent - dt * 0.01)
         self.battery_voltage_v = 42.0 + (self.battery_percent / 100.0) * 16.4
-        # Fake a gentle sinusoidal current draw for the "range" field
         t = time.monotonic() - self.t0
+        # Fake a gentle sinusoidal current draw for the "range" field
         self.motor_current_a = 5.0 + 3.0 * math.sin(t * 0.5)
+        # Optionally sweep the wheel speed across [min, max] to test the UI.
+        if self.speed_wave is not None:
+            lo, hi = self.speed_min, self.speed_max
+            phase = (t % self.speed_period) / self.speed_period   # 0..1
+            if self.speed_wave == "sine":
+                # smooth up-and-down: cos maps 0..1 -> lo..hi..lo
+                frac = (1.0 - math.cos(phase * 2.0 * math.pi)) / 2.0
+            elif self.speed_wave == "triangle":
+                # linear up then down
+                frac = 1.0 - abs(2.0 * phase - 1.0)
+            else:  # "sawtooth": ramp up then snap back to lo
+                frac = phase
+            self.wheel_kph = lo + (hi - lo) * frac
 
 
 # ---- Wire protocol helpers ---------------------------------------------------
@@ -123,6 +144,14 @@ def chk8(*bytes_iter):
     for b in bytes_iter:
         total = (total + b) & 0xFF
     return total
+
+
+def event(msg):
+    """A user-driven state change (PAS, lights, mode, speed limit).
+
+    Always printed to stdout so it shows up in the console regardless of
+    --verbose (which logs raw packets to stderr)."""
+    print(f"[user] {msg}", flush=True)
 
 
 def handle_read(op, state, verbose):
@@ -208,6 +237,8 @@ def parse_display_frames(buf, state, verbose):
                     if verbose: print(f"  WRITE_PAS bad checksum", file=sys.stderr)
                     continue
                 name = BAFANG_LEVEL_TO_NAME.get(level, f"UNKNOWN(0x{level:02x})")
+                if name != state.assist_level:
+                    event(f"assist level → {name} (wire 0x{level:02x})")
                 state.assist_level = name
                 if verbose: print(f"  RX  WRITE_PAS  level=0x{level:02x} → {name}", file=sys.stderr)
                 # bbs-fw does NOT ACK write_pas per extcom.c (returns 4, no uart_write)
@@ -218,6 +249,9 @@ def parse_display_frames(buf, state, verbose):
                 mode, ck = buf[2], buf[3]
                 del buf[0:4]
                 if chk8(cat, op, mode) == ck:
+                    if mode != state.mode:
+                        event(f"mode → 0x{mode:02x}")
+                    state.mode = mode
                     if verbose: print(f"  RX  WRITE_MODE mode=0x{mode:02x}", file=sys.stderr)
                 continue
 
@@ -225,15 +259,23 @@ def parse_display_frames(buf, state, verbose):
                 if len(buf) < 3: return replies
                 state_byte = buf[2]
                 del buf[0:3]
-                state.lights_on = (state_byte == 0xF1)
+                new_lights = (state_byte == 0xF1)
+                if new_lights != state.lights_on:
+                    event(f"lights → {'ON' if new_lights else 'OFF'}")
+                state.lights_on = new_lights
                 if verbose: print(f"  RX  WRITE_LIGHTS {'ON' if state.lights_on else 'OFF'}", file=sys.stderr)
                 continue
 
             if op == OP_WRITE_SPEED_LIM:
                 if len(buf) < 5: return replies
-                # bbs-fw ignores this, just drops the bytes
+                hi, lo = buf[2], buf[3]
+                # bbs-fw ignores this on the wire, but report the user's change
                 del buf[0:5]
-                if verbose: print(f"  RX  WRITE_SPEED_LIM  (ignored)", file=sys.stderr)
+                limit = (hi << 8) | lo
+                if limit != state.speed_limit:
+                    event(f"speed limit → {limit} km/h (0x{hi:02x}{lo:02x})")
+                state.speed_limit = limit
+                if verbose: print(f"  RX  WRITE_SPEED_LIM  {limit} (ignored by motor)", file=sys.stderr)
                 continue
 
             # unknown write opcode — advance one byte and resync
@@ -269,7 +311,13 @@ def configure_baud(fd, baud):
 
 def main():
     ap = argparse.ArgumentParser(description="BBSHD motor emulator (Bafang UART).")
-    ap.add_argument("--speed", type=float, default=0.0, help="initial wheel kph")
+    ap.add_argument("--speed", type=float, default=0.0, help="fixed wheel kph (ignored if --speed-wave is set)")
+    ap.add_argument("--speed-wave", choices=["sine", "triangle", "sawtooth"], default=None,
+                    help="sweep speed over time instead of a fixed value, to test the speed UI")
+    ap.add_argument("--speed-min", type=float, default=0.0, help="min kph for --speed-wave (default 0)")
+    ap.add_argument("--speed-max", type=float, default=45.0, help="max kph for --speed-wave (default 45)")
+    ap.add_argument("--speed-period", type=float, default=20.0,
+                    help="seconds for one full --speed-wave cycle (default 20)")
     ap.add_argument("--batt", type=float, default=90.0, help="initial battery %%")
     ap.add_argument("--baud", type=int, default=1200, help="Bafang baud (default 1200)")
     ap.add_argument("--perimeter", type=int, default=2100,

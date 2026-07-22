@@ -29,9 +29,10 @@ class OLEDWidget: public QWidget {
 public:
 	QImage display;
 	bool display_on = true;
+	static const int SCALE = 4;
 	OLEDWidget(): display(64, 128, QImage::Format_Grayscale8) {
-		setMinimumSize(display.size());
-		setMaximumSize(display.size());
+		setMinimumSize(display.size() * SCALE);
+		setMaximumSize(display.size() * SCALE);
 	}
 	~OLEDWidget() {
 	}
@@ -47,9 +48,9 @@ protected:
 			return &buttonUP;
 		if(evt->key() == Qt::Key_Down)
 			return &buttonDWN;
-		if(evt->key() == Qt::Key_M)
+		if(evt->key() == Qt::Key_M || evt->key() == Qt::Key_Return || evt->key() == Qt::Key_Enter)
 			return &buttonM;
-		if(evt->key() == Qt::Key_P)
+		if(evt->key() == Qt::Key_P || evt->key() == Qt::Key_Escape)
 			return &buttonPWR;
 
 		return NULL;

@@ -29,9 +29,10 @@ class OLEDWidget: public QWidget {
 public:
 	QImage display;
 	bool display_on = true;
+	static const int SCALE = 4;
 	OLEDWidget(): display(64, 128, QImage::Format_Grayscale8) {
-		setMinimumSize(display.size());
-		setMaximumSize(display.size());
+		setMinimumSize(display.size() * SCALE);
+		setMaximumSize(display.size() * SCALE);
 	}
 	~OLEDWidget() {
 	}

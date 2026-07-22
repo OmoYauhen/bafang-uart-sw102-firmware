@@ -81,6 +81,8 @@ class MotorState:
         self.motor_temp_c       = 24
         self.assist_level       = "ASSIST_1"
         self.lights_on          = False
+        self.mode               = None                # last WRITE_MODE value
+        self.speed_limit        = None                # last WRITE_SPEED_LIM value
         self.status_code        = 0x00                # 0 = normal
         # Wheel *perimeter* in mm, matching the firmware's
         # DEFAULT_VALUE_WHEEL_PERIMETER exactly (Bafang's own unit — not derived
@@ -142,6 +144,14 @@ def chk8(*bytes_iter):
     for b in bytes_iter:
         total = (total + b) & 0xFF
     return total
+
+
+def event(msg):
+    """A user-driven state change (PAS, lights, mode, speed limit).
+
+    Always printed to stdout so it shows up in the console regardless of
+    --verbose (which logs raw packets to stderr)."""
+    print(f"[user] {msg}", flush=True)
 
 
 def handle_read(op, state, verbose):
@@ -227,6 +237,8 @@ def parse_display_frames(buf, state, verbose):
                     if verbose: print(f"  WRITE_PAS bad checksum", file=sys.stderr)
                     continue
                 name = BAFANG_LEVEL_TO_NAME.get(level, f"UNKNOWN(0x{level:02x})")
+                if name != state.assist_level:
+                    event(f"assist level → {name} (wire 0x{level:02x})")
                 state.assist_level = name
                 if verbose: print(f"  RX  WRITE_PAS  level=0x{level:02x} → {name}", file=sys.stderr)
                 # bbs-fw does NOT ACK write_pas per extcom.c (returns 4, no uart_write)
@@ -237,6 +249,9 @@ def parse_display_frames(buf, state, verbose):
                 mode, ck = buf[2], buf[3]
                 del buf[0:4]
                 if chk8(cat, op, mode) == ck:
+                    if mode != state.mode:
+                        event(f"mode → 0x{mode:02x}")
+                    state.mode = mode
                     if verbose: print(f"  RX  WRITE_MODE mode=0x{mode:02x}", file=sys.stderr)
                 continue
 
@@ -244,15 +259,23 @@ def parse_display_frames(buf, state, verbose):
                 if len(buf) < 3: return replies
                 state_byte = buf[2]
                 del buf[0:3]
-                state.lights_on = (state_byte == 0xF1)
+                new_lights = (state_byte == 0xF1)
+                if new_lights != state.lights_on:
+                    event(f"lights → {'ON' if new_lights else 'OFF'}")
+                state.lights_on = new_lights
                 if verbose: print(f"  RX  WRITE_LIGHTS {'ON' if state.lights_on else 'OFF'}", file=sys.stderr)
                 continue
 
             if op == OP_WRITE_SPEED_LIM:
                 if len(buf) < 5: return replies
-                # bbs-fw ignores this, just drops the bytes
+                hi, lo = buf[2], buf[3]
+                # bbs-fw ignores this on the wire, but report the user's change
                 del buf[0:5]
-                if verbose: print(f"  RX  WRITE_SPEED_LIM  (ignored)", file=sys.stderr)
+                limit = (hi << 8) | lo
+                if limit != state.speed_limit:
+                    event(f"speed limit → {limit} km/h (0x{hi:02x}{lo:02x})")
+                state.speed_limit = limit
+                if verbose: print(f"  RX  WRITE_SPEED_LIM  {limit} (ignored by motor)", file=sys.stderr)
                 continue
 
             # unknown write opcode — advance one byte and resync

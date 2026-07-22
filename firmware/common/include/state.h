@@ -439,6 +439,23 @@ extern tsdz2_firmware_version_t g_tsdz2_firmware_version;
 
 extern volatile motor_init_status_t ui8_g_motor_init_status;
 
+// Live-parsed Bafang display-protocol state, populated by bafang_parse_reply()
+// in state.c. Exposed here so the Technical config screen can render its
+// fields as read-only diagnostics.
+struct bafang_state_t {
+    uint8_t  status;                // READ_STATUS (0x08)
+    uint8_t  battery_pct;           // READ_BATTERY (0x11)
+    uint16_t wheel_rpm;             // READ_SPEED (0x20)
+    uint16_t battery_voltage_x10;   // READ_CALORIES (0x24) — bbs-fw voltage hijack
+    uint16_t range_field;           // READ_RANGE (0x22) — motor temp/power hijack
+    uint8_t  current_amp_x2;        // READ_CURRENT (0x0A), scaled: A * 2
+    uint8_t  moving;                // READ_MOVING (0x31): 0 = still, 1 = moving
+    uint32_t rx_count;              // successful replies received (all opcodes)
+    uint32_t chk_fail_count;        // per-opcode checksum failures
+    uint32_t timeout_count;         // request → reply timeouts
+};
+extern volatile struct bafang_state_t g_bafang;
+
 // Battery voltage (readed on motor controller):
 #define ADC_BATTERY_VOLTAGE_PER_ADC_STEP_X10000 866
 

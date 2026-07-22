@@ -63,21 +63,9 @@ static uint8_t bafang_awaiting_reply = 0;
 static uint16_t bafang_reply_timeout_ticks = 0;
 #define BAFANG_REPLY_TIMEOUT_TICKS 5   // 5 x 100ms = 500 ms
 
-// Parsed live state, populated from motor replies. UI mapping to
-// ui_vars/rt_vars is intentionally deferred to the next commit — for
-// now these globals are the smoke-test surface.
-struct bafang_state_t {
-    uint8_t  status;
-    uint8_t  battery_pct;
-    uint16_t wheel_rpm;
-    uint16_t battery_voltage_x10;
-    uint16_t range_field;         // motor temp or power (bbs-fw config-dependent)
-    uint8_t  current_amp_x2;
-    uint8_t  moving;
-    uint32_t rx_count;
-    uint32_t chk_fail_count;
-    uint32_t timeout_count;
-};
+// Parsed live state, populated from motor replies. Struct definition
+// lives in common/include/state.h so the Technical config screen can
+// render these as read-only diagnostics.
 volatile struct bafang_state_t g_bafang = { 0 };
 
 static void bafang_send_read(uint8_t opcode, uint8_t reply_len) {

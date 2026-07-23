@@ -258,6 +258,23 @@ static void bafang_apply_directs(void) {
     rt_vars.ui8_pedal_cadence_filtered = 99;
 }
 
+// The odometer, trip distance and trip average-speed integrators all key off
+// ui32_wheel_speed_sensor_tick_counter — a cumulative wheel-revolution count
+// the TSDZ2 motor used to report. The Bafang display protocol only reports
+// instantaneous wheel RPM (opcode 0x20), so nothing advances that counter and
+// distance would stay pinned at 0. Synthesise it here: at the 100 ms tick rate,
+// accumulate revolutions from the current RPM (one revolution == 600 rpm-ticks,
+// i.e. rpm/600 per 100 ms), keeping the sub-revolution remainder so slow speeds
+// aren't lost.
+static void bafang_synth_wheel_ticks(void) {
+    static uint32_t rpm_accumulator;   // 600 accumulated rpm == one revolution
+    rpm_accumulator += g_bafang.wheel_rpm;
+    while (rpm_accumulator >= 600) {
+        rpm_accumulator -= 600;
+        rt_vars.ui32_wheel_speed_sensor_tick_counter++;
+    }
+}
+
 
 void ui_motor_stabilized();
 void ui_show_motor_status(motor_init_state_t state);
@@ -869,6 +886,7 @@ void rt_processing(void)
 
   /************************************************************************************************/
   // now do all the calculations that must be done every 100ms
+  bafang_synth_wheel_ticks();   // feed the distance integrators (no tick counter on the wire)
   rt_low_pass_filter_battery_voltage_current_power();
   rt_low_pass_filter_pedal_power();
   rt_low_pass_filter_pedal_cadence();

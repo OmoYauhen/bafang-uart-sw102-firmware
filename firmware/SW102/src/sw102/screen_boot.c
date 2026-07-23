@@ -4,41 +4,26 @@
 #include "state.h"
 
 const
-#include "logo.xbm"
-const
-#include "logo_anim.xbm"
+#include "sparkles.xbm"
 
-DEFINE_IMAGE(logo);
-DEFINE_IMAGE(logo_anim);
+DEFINE_IMAGE(sparkles);
 
 extern const struct screen screen_main;
 
+// Show the boot screen until the motor sends its first packet. The Bafang
+// protocol has no boot handshake (g_motor_init_state is READY from the start),
+// so the transition is keyed off the first successfully parsed reply instead
+// of the motor-init state machine.
 static void boot_idle()
 {
-	switch (g_motor_init_state) {
-		case MOTOR_INIT_SIMULATING:
-			if(tick < 100)
-				break;
-
-		case MOTOR_INIT_WAIT_GOT_CONFIGURATIONS_OK:
-		case MOTOR_INIT_READY:
-			showScreen(&screen_main);
-			return;
-
-		// any error state will block here and avoid leave the boot screen
-		default:
-			break;
+	if (g_bafang.rx_count > 0) {
+		showScreen(&screen_main);
+		return;
 	}
 
-	if(tick&3)
-		return;
-
-	static int q=1;
-	fill_rect(0,0,64,69, false);
-	img_draw(&img_logo, 16, 17);
-	img_draw_clip(&img_logo_anim, 8, 29, 0, q*18, 18, 18, 0);
-	q=(q+3)&3;
-	img_draw_clip(&img_logo_anim, 38, 29, 0, q*18, 18, 18, 0);
+	fill_rect(0, 0, 64, 128, false);
+	// image is 64px wide (full screen width); center it vertically on 128px
+	img_draw(&img_sparkles, (64 - img_sparkles.w) / 2, (128 - img_sparkles.h) / 2);
 	lcd_refresh();
 }
 

@@ -12,14 +12,105 @@ they describe a different motor-side protocol:
 - https://github.com/OpenSource-EBike-firmware/Color_LCD/wiki/Bafang-LCD-SW102
 - https://github.com/OpenSource-EBike-firmware/SW102_LCD_Bluetooth/wiki
 
-## How to build on Windows
+## Building the on-target firmware
 
-TBD
+The `Makefile` (as opposed to `Makefile.emu`) cross-compiles the firmware
+for the SW102's nRF51x22 (Cortex-M0) and produces `_build/nrf51822_sw102.hex`,
+suitable for flashing via SWD (ST-Link + OpenOCD) or for wrapping into a
+signed OTA DFU zip.
 
-## How to build on Linux
+### Toolchain
 
-* Extract https://launchpad.net/gcc-arm-embedded/4.9/4.9-2015-q3-update/+download/gcc-arm-none-eabi-4_9-2015q3-20150921-linux.tar.bz2 into /usr/local/gcc-arm-none-eabi-4_9-2015q3.
-* Run "make"
+You need `arm-none-eabi-gcc` and `arm-none-eabi-newlib`. Modern versions
+work fine — this fork has been built with GCC 15.2 (nixpkgs
+`gcc-arm-embedded`); the upstream README's ancient 4.9/2015q3 pin is no
+longer required.
+
+* **NixOS / Nix (any platform)**:
+  ```
+  nix shell nixpkgs#gcc-arm-embedded nixpkgs#gnumake nixpkgs#python3
+  export GNU_INSTALL_ROOT=$(dirname $(dirname $(which arm-none-eabi-gcc)))
+  ```
+* **Debian / Ubuntu**: `sudo apt install gcc-arm-none-eabi python3 make`
+* **Fedora**: `sudo dnf install arm-none-eabi-gcc-cs arm-none-eabi-newlib python3 make`
+* **macOS + Homebrew**: `brew install --cask gcc-arm-embedded && brew install python3`
+
+### Building `.hex`
+
+```
+cd firmware/SW102
+make -f Makefile clean_project
+make -f Makefile _build/nrf51822_sw102.hex
+```
+
+Expected size on the current `main`: roughly 48 KB `.text` + 300 B `.data`
++ 6 KB `.bss`, comfortably within the nRF51x22's 256 KB flash / 16 KB RAM.
+Warnings from the newlib stubs (`_close is not implemented`) are benign —
+those syscalls are unused after link-time garbage collection.
+
+### Packaging the DFU (OTA) zip
+
+Wraps the `.hex` into a signed Nordic DFU package that can be delivered
+over BLE to a running bootloader. Uses Nordic's current `nrfutil` (Rust
+rewrite, v8.x) with the `nrf5sdk-tools` subcommand — the same CLI shape
+the SDK 12.3 Makefile expected. `firmware/SW102/prebuilt/private.key` is
+the signing key checked into the repo.
+
+**On NixOS**, `nrfutil` requires accepting the unfree Segger JLink
+license, and the Nordic subcommand binaries are generic-linux ELFs that
+need an FHS environment. Both are handled here:
+
+```
+mkdir -p _release
+nix-shell --impure \
+  --arg config '{ allowUnfree = true; segger-jlink.acceptLicense = true; }' \
+  -p nrfutil steam-run --run '
+    # one-time: install the nrf5sdk-tools subcommand into ~/.nrfutil
+    steam-run nrfutil install nrf5sdk-tools
+
+    # then package the zip
+    steam-run nrfutil nrf5sdk-tools pkg generate \
+      --application _build/nrf51822_sw102.hex \
+      --key-file prebuilt/private.key \
+      --application-version 27 \
+      --hw-version 51 \
+      --sd-req 0x87 \
+      _release/sw102-otaupdate-$(git rev-parse --short HEAD).zip
+  '
+```
+
+**On non-NixOS Linux** (Debian/Ubuntu/Fedora), install `nrfutil` from
+Nordic's release page, then drop the `steam-run` wrapper:
+
+```
+nrfutil install nrf5sdk-tools
+nrfutil nrf5sdk-tools pkg generate \
+  --application _build/nrf51822_sw102.hex \
+  --key-file prebuilt/private.key \
+  --application-version 27 \
+  --hw-version 51 \
+  --sd-req 0x87 \
+  _release/sw102-otaupdate-$(git rev-parse --short HEAD).zip
+```
+
+Fields:
+
+- `--application-version` — **bump this for every release** you flash. The
+  bootloader rejects packages whose version is not strictly greater than
+  what's currently installed unless a debug mode is set. Track it
+  alongside `VERSION_STRING` in `../common/Makefile.common`.
+- `--hw-version 51` — nRF51 family.
+- `--sd-req 0x87` — CRC of SoftDevice s130 2.0.1 (matches
+  `nRF5_SDK_12.3.0/components/softdevice/s130/hex/`). Change this only if
+  you rebuild against a different SoftDevice.
+- `--key-file` — must match the public key baked into the installed
+  bootloader. The one in `prebuilt/private.key` pairs with the prebuilt
+  bootloader in the same directory.
+
+The resulting zip contains `manifest.json`, `nrf51822_sw102.dat` (init
+packet), and `nrf51822_sw102.bin` — deliverable to a bootloader via
+`nrfutil dfu ble ...` or any BLE DFU app (see the "Debugging bluetooth
+linux" section below).
 
 ## Running the desktop emulator
 

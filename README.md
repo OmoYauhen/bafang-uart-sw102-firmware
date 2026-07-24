@@ -1,36 +1,43 @@
+# swang-stodva
+
+**Open-source Bafang display firmware for the SW102 handlebar display.**
+
+![status: alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge)
+
+> [!WARNING]
+> ## ⚠️ Alpha software — not recommended for daily use
+>
+> This firmware is in **early alpha**: under active development and only
+> lightly tested on real hardware, with known rough edges (see below). Expect
+> bugs and breaking changes — **don't rely on it for a bike you depend on.**
 
 This is a fork of [anszom/SW102_LCD](https://github.com/anszom/SW102_LCD),
 ported from the **TSDZ2** motor's UART protocol to the **Bafang** display
 UART protocol used by BBS02 / BBSHD mid-drive motors. It runs on the
-[Bafang SW102 display](https://github.com/OpenSource-EBike-firmware/SW102_LCD_Bluetooth/wiki)
-and speaks the same wire protocol as a stock Bafang display, so it works
+Bafang SW102 display and speaks the same wire protocol as a stock Bafang display, so it works
 against either stock Bafang firmware or [`bbs-fw`](https://github.com/danielnilsson9/bbs-fw)
 (the open-source app-MCU replacement).
 
 Upstream lineage: `casainho/Color_LCD` → `anszom/SW102_LCD` (new UI) →
 this fork (Bafang wire protocol).
 
-## Demo
-
-![video](sw102.gif)
-
 Features:
 
 - runs on the Bafang SW102 handlebar display
+- confirmed running on real hardware: SW102 display driving a Bafang BBSHD (HD) mid-drive motor
 - talks the Bafang display UART protocol (1200 baud, `0x11`/`0x16` category bytes)
 - polls the motor for status, current, battery, speed, temperature, voltage, moving state
 - writes assist level (PAS), lights, and walk-assist state back to the motor
 - built-in support for `bbs-fw`'s field hijacks (motor temperature via `READ_RANGE`, battery voltage ×10 via `READ_CALORIES`)
 - new UI with smooth graphics, graphs, and 50 fps update rate
-- desktop emulator build for developing without hardware — see [`firmware/SW102/README.md`](firmware/SW102/README.md)
+- desktop emulator build for developing without hardware — see [`docs/BUILD.md`](docs/BUILD.md)
 - assist level defined as percentage (100 % = motor matches rider power)
 
 Known issues / rough edges:
 
 - pedal cadence is stubbed at 99 — BBSHD doesn't report RPM in its display protocol, still deciding how to synthesise or hide it
 - BT connectivity hasn't been tested
-- 850/860 (colour LCD) targets in the tree still speak TSDZ2 and are not covered by this port
-- flashing on real hardware not yet exercised — emulator-verified end-to-end but the SW102 hardware hasn't been touched
+- real-hardware testing is still limited — it runs on a real BBSHD, but only lightly exercised so far (hence: alpha)
 - startup boost menu removed (never worked, per casainho's wiki)
 - virtual throttle removed
 
@@ -47,8 +54,8 @@ the device [as described here](https://github.com/OpenSourceEBike/TSDZ2_wiki/wik
 and flash the bootloader. Afterwards you can switch to this version using the
 procedure described above.
 
-To build from source, see [firmware/SW102/README.md](firmware/SW102/README.md)
-for instructions (Nix + `nix-shell` for reproducible builds, or system Qt5 for
+To build from source, see [docs/BUILD.md](docs/BUILD.md)
+for instructions (Nix + `nix build` for reproducible builds, or system Qt5 for
 Debian/Ubuntu/Fedora/macOS).
 
 ## Usage
@@ -61,21 +68,21 @@ visible:
 - top: battery icon & percentage (read directly from the motor)
 - central large display: speed
 - central small display: extra information (odometer, trip distance, trip
-  time, average speed, pedal power, motor power)
+  time, average speed, motor power)
 - bottom indicators: WALK (walk assist), BRK (braking), lights
 
 The following key actions are available:
 
 - **UP/DOWN**: adjust assist level
-- **PWR**: toggle lights
-- hold **PWR**: turn off
-- **M**: cycle extra information display
-- hold **M**: enter configuration menu
+- **ESC**: toggle lights
+- hold **ESC**: turn off
+- **ENTER**: cycle extra information display
+- hold **ENTER**: enter configuration menu
 - hold **UP**: toggle Street Mode (if enabled in configuration)
 - hold **DOWN**: Walk Assist (if enabled in configuration)
 
-In the configuration screen, you use UP/DOWN for navigation, M to accept,
-and PWR to go back.
+In the configuration screen, you use UP/DOWN for navigation, ENTER to accept,
+and ESC to go back.
 
 ## Compatibility
 
@@ -105,18 +112,12 @@ the same power as the rider, 50% half, 200% double. The display remaps its
 level number (0..9) to Bafang's non-monotonic wire codes on the fly
 (`0x00 0x01 0x0B 0x0C 0x0D 0x02 0x15 0x16 0x17 0x03`).
 
-### 850 / 860 displays
-
-Although this repo contains code for the 8xx displays, it's leftover from the
-fork and still speaks TSDZ2. The 8xx code should compile but has not been
-ported to Bafang.
-
 ## Development
 
 ### Source changes relative to the anszom/SW102_LCD fork
 
-The "backend" changes concentrate in `firmware/common/src/state.c` and
-`firmware/common/include/uart.h`:
+The "backend" changes concentrate in `common/src/state.c` and
+`common/include/uart.h`:
 
 - new Bafang RX byte-level state machine (`uart_prime_rx(len)` API,
   caller-declared reply length, no CRC — checksums are opcode-specific)
@@ -135,7 +136,6 @@ Linux app driving a Qt5 window. This allows for a much quicker development
 cycle.
 
 ```
-cd firmware/SW102
 nix-shell
 make -f Makefile.emu
 ./emu
@@ -152,5 +152,5 @@ python3 -u tools/bbshd_mock.py --verbose --speed 20 --batt 60
 SW102_UART_PORT=/dev/pts/N ./emu
 ```
 
-See [`firmware/SW102/tools/BBSHD_MOCK.md`](firmware/SW102/tools/BBSHD_MOCK.md)
+See [`tools/BBSHD_MOCK.md`](tools/BBSHD_MOCK.md)
 for the mock's protocol coverage and options.

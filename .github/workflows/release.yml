@@ -1,0 +1,117 @@
+name: Release
+
+# Manually-triggered release. Bumps the version, builds the flashable
+# artifacts (reproducibly, via the flake), checksums them, and publishes a
+# GitHub Release. Always releases from main.
+on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Version bump"
+        type: choice
+        default: prerelease
+        options: [prerelease, finalize, patch, minor, major]
+      prerelease_label:
+        description: "Pre-release label (used when release_type = prerelease)"
+        type: string
+        default: alpha
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0          # full history so release notes can diff tags
+
+      - name: Bump version
+        id: bump
+        run: |
+          set -euo pipefail
+          read VER NUM < <(python3 tools/bump-version.py \
+            --type "${{ inputs.release_type }}" \
+            --label "${{ inputs.prerelease_label }}" --write)
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "build=$NUM"   >> "$GITHUB_OUTPUT"
+          echo "tag=v$VER"    >> "$GITHUB_OUTPUT"
+          if [[ "$VER" == *-* ]]; then echo "prerelease=true"  >> "$GITHUB_OUTPUT";
+          else                         echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+          echo "Releasing v$VER (build $NUM)"
+
+      # Reproducible toolchain: build the .hex via the pinned flake so the
+      # released image matches what developers build locally.
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v16
+
+      - name: Build firmware .hex
+        run: nix build .#firmware -o result-fw
+
+      - name: Install packaging tools (srecord + Nordic nrfutil)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y srecord
+          curl -L -o "$HOME/.local/bin/nrfutil" --create-dirs \
+            https://files.nordicsemi.com/artifactory/swtools/external/nrfutil/executables/x86_64-unknown-linux-gnu/nrfutil
+          chmod +x "$HOME/.local/bin/nrfutil"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/nrfutil" install nrf5sdk-tools
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          VER="${{ steps.bump.outputs.version }}"
+          NUM="${{ steps.bump.outputs.build }}"
+          APP=result-fw/nrf51822_sw102.hex
+          SD=nRF5_SDK_12.3.0/components/softdevice/s130/hex/s130_nrf51_2.0.1_softdevice.hex
+          BL=prebuilt/sw102_bootloader.hex
+          KEY=prebuilt/private.key
+          mkdir -p dist
+
+          # (1) bare application image — SWD flash when bootloader+SoftDevice are present
+          cp "$APP" "dist/swang-stodva-app-$VER.hex"
+
+          # (2) BLE DFU (OTA) package — signed, deliverable to the bootloader over BLE
+          nrfutil nrf5sdk-tools pkg generate \
+            --application "$APP" --key-file "$KEY" \
+            --application-version "$NUM" --hw-version 51 --sd-req 0x87 \
+            "dist/swang-stodva-otaupdate-$VER.zip"
+
+          # (3) full SWD image — bootloader + SoftDevice + app + bootloader settings,
+          #     for flashing a blank/erased device over SWD
+          nrfutil nrf5sdk-tools settings generate --no-backup --family NRF51 \
+            --application "$APP" --application-version "$NUM" \
+            --bootloader-version 0 --bl-settings-version 1 dist/bootloader_setting.hex
+          srec_cat "$BL" -Intel "$SD" -Intel "$APP" -Intel dist/bootloader_setting.hex -Intel \
+            -Output "dist/swang-stodva-full-$VER.hex" -Intel
+          rm -f dist/bootloader_setting.hex
+
+          # (4) checksums
+          ( cd dist && sha256sum swang-stodva-* | tee SHA256SUMS )
+          ls -la dist
+
+      - name: Commit version bump and tag
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add common/Makefile.common
+          git commit -m "release: ${{ steps.bump.outputs.tag }}"
+          git tag -a "${{ steps.bump.outputs.tag }}" -m "${{ steps.bump.outputs.tag }}"
+          git push origin HEAD:main
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.bump.outputs.tag }}" dist/* \
+            --title "${{ steps.bump.outputs.tag }}" \
+            --generate-notes \
+            ${{ steps.bump.outputs.prerelease == 'true' && '--prerelease' || '' }}

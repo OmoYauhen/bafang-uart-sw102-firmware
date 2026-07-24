@@ -1,0 +1,9 @@
+# Project specific
+_build
+_release
+/emu
+*.bin
+*.pgm
+/out/
+/result
+/result-*

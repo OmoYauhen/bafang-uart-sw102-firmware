@@ -1,9 +1,0 @@
-*.bin
-*.elf
-*.lst
-*.o
-build
-debug
-.dep
-
-common
